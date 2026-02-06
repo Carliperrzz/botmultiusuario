@@ -1,59 +1,50 @@
-require('dotenv').config();
+require('dotenv').config?.();
 
-const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const session = require('express-session');
 
-const { loadJSON, saveJSON, htmlEscape } = require('./src/utils');
+const { loadJSON, saveJSON, htmlEscape, applyTemplate } = require('./src/utils');
 const { createBot } = require('./src/botCore');
 const { qrDataUrl, layoutMobile, layoutDesktop } = require('./src/panelTemplates');
 
 const qrDataUrlFn = async (qr) => (qr ? qrDataUrl(qr) : null);
+const fs = require('fs');
 
-// Base do projeto (Railway usa /app)
 const BASE_DIR = __dirname;
 
-// ✅ Em Railway, recomenda montar um Volume em /app/data
-const DATA_BASE = process.env.DATA_DIR
-  ? path.resolve(process.env.DATA_DIR)
-  : path.join(BASE_DIR, 'data');
+// Railway: monte um Volume em /app/data e set:
+// DATA_DIR=/app/data
+// AUTH_DIR=/app/data/auth
+const DATA_BASE = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(BASE_DIR, 'data');
+const AUTH_BASE = process.env.AUTH_DIR ? path.resolve(process.env.AUTH_DIR) : path.join(DATA_BASE, 'auth');
 
-// Auth dentro do data (persistente com volume)
-const AUTH_BASE = process.env.AUTH_DIR
-  ? path.resolve(process.env.AUTH_DIR)
-  : path.join(DATA_BASE, 'auth');
-
-const BOT_IDS = ['v1','v2','v3','v4','v5'];
-
-// ------- Files -------
-const EVENTS_FILE = path.join(DATA_BASE, 'events.json');
-const USERS_FILE = path.join(DATA_BASE, 'users.json');
-const SCHEDULES_FILE = path.join(DATA_BASE, 'schedules.json');
-
-// ✅ garante estrutura de pastas/arquivos antes de qualquer coisa
-function ensureBaseStorage() {
-  try {
-    fs.mkdirSync(DATA_BASE, { recursive: true });
-    fs.mkdirSync(AUTH_BASE, { recursive: true });
-
-    for (const botId of BOT_IDS) {
-      fs.mkdirSync(path.join(DATA_BASE, botId), { recursive: true });
-      fs.mkdirSync(path.join(AUTH_BASE, botId), { recursive: true });
+function ensureBaseStorage(){
+  try{
+    fs.mkdirSync(DATA_BASE,{recursive:true});
+    fs.mkdirSync(AUTH_BASE,{recursive:true});
+    for (const botId of BOT_IDS){
+      fs.mkdirSync(path.join(DATA_BASE, botId), {recursive:true});
+      fs.mkdirSync(path.join(AUTH_BASE, botId), {recursive:true});
     }
-
-    if (!fs.existsSync(EVENTS_FILE)) fs.writeFileSync(EVENTS_FILE, '[]', 'utf8');
-    if (!fs.existsSync(SCHEDULES_FILE)) fs.writeFileSync(SCHEDULES_FILE, '[]', 'utf8');
-  } catch (e) {
-    console.error('[BOOT] Falha ao preparar pastas de dados:', e?.message || e);
+    // garante arquivos básicos
+    const eventsFile = path.join(DATA_BASE,'events.json');
+    if (!fs.existsSync(eventsFile)) fs.writeFileSync(eventsFile,'[]','utf8');
+  }catch(e){
+    console.error('[BOOT] storage fail:', e?.message || e);
   }
 }
 ensureBaseStorage();
 
+const BOT_IDS = ['v1','v2','v3','v4','v5'];
+
+// ------- event logger (global) -------
+const EVENTS_FILE = path.join(DATA_BASE, 'events.json');
 function appendEvent(evt) {
   try {
     const arr = loadJSON(EVENTS_FILE, []);
-    arr.push({ ...evt, ts: evt.ts || new Date().toISOString() });
+    arr.push(evt);
+    // keep last 50k to avoid huge file
     const trimmed = arr.length > 50000 ? arr.slice(arr.length - 50000) : arr;
     saveJSON(EVENTS_FILE, trimmed);
   } catch (e) {
@@ -61,49 +52,21 @@ function appendEvent(evt) {
   }
 }
 
-// ------- bots (lazy init) -------
-const bots = {}; // { [botId]: botInstance }
-
-function getBot(botId) {
-  const id = BOT_IDS.includes(botId) ? botId : 'v1';
-  if (!bots[id]) {
-    try {
-      fs.mkdirSync(path.join(AUTH_BASE, id), { recursive: true });
-      fs.mkdirSync(path.join(DATA_BASE, id), { recursive: true });
-    } catch (_) {}
-
-    bots[id] = createBot({
-      botId: id,
-      baseDir: BASE_DIR,
-      authDir: path.join(AUTH_BASE, id),
-      eventLogger: appendEvent
-    });
-  }
-  return bots[id];
+// ------- bots -------
+const bots = {};
+for (const botId of BOT_IDS) {
+  bots[botId] = createBot({
+    botId,
+    baseDir: BASE_DIR,
+    authDir: path.join(AUTH_BASE, botId),
+    eventLogger: appendEvent
+  });
 }
 
 // ------- users -------
+const USERS_FILE = path.join(DATA_BASE, 'users.json');
 function loadUsers(){ return loadJSON(USERS_FILE, {}); }
 function saveUsers(u){ return saveJSON(USERS_FILE, u); }
-
-// cria usuários padrão se users.json não existir (não sobrescreve)
-(function ensureDefaultUsers(){
-  try {
-    if (fs.existsSync(USERS_FILE)) return;
-    const seed = {
-      admin: { role: 'admin', botId: '*', pass: 'admin' }, // tu screenshot muestra admin/admin
-      v1: { role: 'seller', botId: 'v1', pass: '123' },
-      v2: { role: 'seller', botId: 'v2', pass: '123' },
-      v3: { role: 'seller', botId: 'v3', pass: '123' },
-      v4: { role: 'seller', botId: 'v4', pass: '123' },
-      v5: { role: 'seller', botId: 'v5', pass: '123' },
-    };
-    saveJSON(USERS_FILE, seed);
-    console.log('[BOOT] users.json criado com usuários padrão.');
-  } catch (e) {
-    console.error('[BOOT] Falha ao criar users.json:', e?.message || e);
-  }
-})();
 
 function getUser(req){
   const users = loadUsers();
@@ -126,123 +89,15 @@ function allowedBotIds(user){
   return [user.botId];
 }
 
-function getSelectedBotId(reqLike){
-  if (!reqLike?.user) return 'v1';
-  if (reqLike.user.role !== 'admin') return reqLike.user.botId;
-  const q = reqLike.query?.botId;
+function getSelectedBotId(req){
+  if (req.user.role !== 'admin') return req.user.botId;
+  const q = req.query.botId;
   if (q && BOT_IDS.includes(q)) return q;
+  // default v1
   return 'v1';
 }
 
-function pickBot(req){
-  const botId = getSelectedBotId({ user: req.user, query: { botId: req.query.botId } });
-  const allowed = allowedBotIds(req.user);
-  return { botId, allowed, bot: getBot(botId) };
-}
 
-function renderPage(req,res,{ title, bodyHtml, footerHtml }){
-  res.send(layoutMobile({
-    title,
-    user: { name: req.user.username, role: req.user.role, username: req.user.username },
-    username: req.user.username,
-    role: req.user.role,
-    bodyHtml,
-    footerHtml
-  }));
-}
-
-// ------- schedules (persistente) -------
-function loadSchedules(){ return loadJSON(SCHEDULES_FILE, []); }
-function saveSchedules(arr){ return saveJSON(SCHEDULES_FILE, arr); }
-
-function newId(){
-  return Math.random().toString(36).slice(2,8) + '-' + Date.now().toString(36);
-}
-
-function safeJSONParse(maybeStr, fallback){
-  try{
-    if (typeof maybeStr === 'string') return JSON.parse(maybeStr);
-    if (typeof maybeStr === 'object' && maybeStr) return maybeStr;
-    return fallback;
-  }catch{ return fallback; }
-}
-
-function brPhoneToJid(phone){
-  const digits = String(phone || '').replace(/\D/g,'');
-  if (!digits) return null;
-  const full = digits.startsWith('55') ? digits : ('55' + digits);
-  return full + '@s.whatsapp.net';
-}
-
-// 🔥 intento automático de envío según tu botCore
-async function sendTextWithBot(bot, toJid, text){
-  const candidates = ['sendText','sendMessage','send','enqueueMessage','queueMessage','sendOut'];
-  for (const fn of candidates) {
-    if (typeof bot?.[fn] === 'function') {
-      try {
-        if (fn === 'sendMessage') return await bot[fn](toJid, { text });
-        if (fn === 'enqueueMessage' || fn === 'queueMessage') return await bot[fn]({ to: toJid, text });
-        return await bot[fn](toJid, text);
-      } catch (_) {}
-    }
-  }
-  if (bot?.sock && typeof bot.sock.sendMessage === 'function') {
-    return await bot.sock.sendMessage(toJid, { text });
-  }
-  throw new Error('BotCore sem método de envio detectado (sendText/sendMessage/enqueueMessage)');
-}
-
-// scheduler tick cada 10s
-async function schedulerTick(){
-  const now = Date.now();
-  const arr = loadSchedules();
-  let changed = false;
-
-  for (const job of arr) {
-    if (job.status !== 'pending') continue;
-    if (!job.runAt) continue;
-    if (Number(job.runAt) > now) continue;
-
-    job.status = 'running';
-    job.startedAt = new Date().toISOString();
-    changed = true;
-    saveSchedules(arr);
-
-    try {
-      const bot = getBot(job.botId || 'v1');
-      const st = bot.getStatus?.() || {};
-      if (!st.connected) throw new Error('bot desconectado');
-      if (!st.enabled) throw new Error('bot pausado');
-
-      const jid = brPhoneToJid(job.phone);
-      if (!jid) throw new Error('telefone inválido');
-
-      await sendTextWithBot(bot, jid, job.text);
-
-      job.status = 'done';
-      job.doneAt = new Date().toISOString();
-      appendEvent({ botId: job.botId, action: 'scheduled_sent', phone: job.phone, jobId: job.id });
-    } catch (e) {
-      job.status = 'error';
-      job.error = String(e?.message || e);
-      job.failedAt = new Date().toISOString();
-      appendEvent({ botId: job.botId, action: 'scheduled_error', phone: job.phone, jobId: job.id, error: job.error });
-    } finally {
-      changed = true;
-      saveSchedules(arr);
-    }
-  }
-
-  if (changed) saveSchedules(arr);
-}
-
-setInterval(() => {
-  schedulerTick().catch((e)=>console.error('[schedulerTick]', e?.message || e));
-}, 10000);
-
-// =======================
-// Express app
-// =======================
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -259,107 +114,72 @@ app.get('/health', (req,res)=>res.status(200).send('ok'));
 app.get('/', (req,res)=>res.redirect('/m'));
 app.get('/app', requireAuth, (req,res)=>res.sendFile(path.join(__dirname,'public','app','index.html')));
 
-// ------- AUTH -------
-app.get('/login', (req,res)=>{
-  const html = `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Login</title>
-  <style>
-    body{margin:0;background:#0b1220;color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;}
-    .wrap{max-width:420px;margin:0 auto;padding:26px 14px}
-    .card{background:#0f172a;border:1px solid #1f2a44;border-radius:16px;padding:16px}
-    h1{margin:0 0 10px 0;font-size:18px}
-    label{display:block;margin:10px 0 6px;color:#94a3b8;font-size:12px}
-    input{width:100%;box-sizing:border-box;background:#0b1220;color:#e5e7eb;border:1px solid #1f2a44;border-radius:12px;padding:12px}
-    button{width:100%;margin-top:12px;background:#facc15;color:#111827;border:none;border-radius:14px;padding:12px 14px;font-weight:700}
-    .muted{color:#94a3b8;font-size:12px;margin-top:10px}
-  </style></head><body>
-  <div class="wrap"><div class="card">
-    <h1>🔐 Login · Iron Glass MultiBot</h1>
-    <form method="POST" action="/login">
-      <label>Usuário</label><input name="username" placeholder="admin / v1 / v2 ..." required/>
-      <label>Senha</label><input name="password" type="password" required/>
-      <button type="submit">Entrar</button>
-      <div class="muted">Dica: admin/admin · v1/123 ...</div>
-    </form>
-  </div></div></body></html>`;
-  res.send(html);
+// ------- API (modo App) -------
+app.get('/api/me', requireAuth, (req,res)=>{
+  res.json({
+    username: req.user.username,
+    role: req.user.role,
+    defaultBotId: (req.user.role === 'admin' ? 'v1' : req.user.botId),
+    allowedBotIds: allowedBotIds(req.user)
+  });
 });
 
-app.post('/login', (req,res)=>{
-  const username = (req.body.username || '').trim();
-  const password = (req.body.password || '').trim();
-  const users = loadUsers();
-  const u = users[username];
-  if (!u || (u.pass || u.password) !== password) return res.redirect('/login');
-  req.session.user = { username };
-  res.redirect('/m');
-});
-
-app.get('/logout', (req,res)=>{
-  req.session.destroy(()=>res.redirect('/login'));
-});
-
-// ------- API -------
 app.get('/api/status', requireAuth, async (req,res)=>{
   const botId = getSelectedBotId({ user: req.user, query: { botId: req.query.botId } });
-  const st = getBot(botId).getStatus?.() || {};
+  const st = bots[botId].getStatus();
   const qr = st.qr || null;
   const qrDataUrl = await qrDataUrlFn(qr);
-  res.json({ botId, connected: !!st.connected, enabled: !!st.enabled, queueSize: st.queueSize ?? 0, qrDataUrl });
+  res.json({ botId, connected: st.connected, enabled: st.enabled, queueSize: st.queueSize, qrDataUrl });
 });
 
 app.post('/api/toggle-connect', requireAuth, async (req,res)=>{
-  try{
-    const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
-    const b = getBot(botId);
-    const st = b.getStatus?.() || {};
-    if (st.connected) await b.disconnect?.();
-    else await b.connect?.();
-    res.json({ ok:true });
-  }catch(e){
-    res.status(500).json({ ok:false, error: String(e?.message || e) });
-  }
+  const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
+  const st = bots[botId].getStatus();
+  if (st.connected) await bots[botId].disconnect(); else await bots[botId].connect();
+  res.json({ ok:true });
 });
 
 app.post('/api/toggle-enabled', requireAuth, (req,res)=>{
-  try{
-    const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
-    const b = getBot(botId);
-    const st = b.getStatus?.() || {};
-    b.setEnabled?.(!st.enabled);
-    res.json({ ok:true });
-  }catch(e){
-    res.status(500).json({ ok:false, error: String(e?.message || e) });
-  }
+  const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
+  const st = bots[botId].getStatus();
+  bots[botId].setEnabled(!st.enabled);
+  res.json({ ok:true });
 });
 
-// Stats simples
+// Stats: total messages + car-year buckets based on "Regras.minYearFollowUp"
 app.get('/api/stats', requireAuth, (req,res)=>{
   const botId = getSelectedBotId({ user: req.user, query: { botId: req.query.botId } });
-  const b = getBot(botId);
-
-  const rules = b.getConfig?.()?.rules || { minYearFollowUp: 2022 };
+  const rules = bots[botId].getConfig()?.rules || { minYearFollowUp: 2022 };
   const minYear = Number(rules.minYearFollowUp || 2022);
 
+  // total auto sent from events
   const events = loadJSON(EVENTS_FILE, []);
-  const totalSent = events.filter(e => e.botId === botId && (e.action === 'auto_sent' || e.action === 'scheduled_sent')).length;
+  const totalSent = events.filter(e => e.botId === botId && e.action === 'auto_sent').length;
 
-  const leads = b.getLeads?.() || {};
+  // car buckets from leads (unique contacts)
+  const leads = bots[botId].getLeads();
   let below = 0, atOrAbove = 0;
   for (const lead of Object.values(leads||{})) {
-    const y = Number(lead.year || lead.ano || 0);
+    const y = Number(lead.year || 0);
     if (!y) continue;
     if (y < minYear) below += 1;
     else atOrAbove += 1;
   }
 
-  res.json({ botId, minYearFollowUp: minYear, totalMessagesSent: totalSent, carsBelowMinYear: below, carsAtOrAboveMinYear: atOrAbove });
+  res.json({
+    botId,
+    minYearFollowUp: minYear,
+    totalMessagesSent: totalSent,
+    carsBelowMinYear: below,
+    carsAtOrAboveMinYear: atOrAbove
+  });
 });
 
-// Users CRUD (admin)
+// Users admin CRUD (admin only)
 app.get('/api/users', requireAuth, (req,res)=>{
   if (req.user.role !== 'admin') return res.status(403).json({error:'forbidden'});
-  res.json({ users: loadUsers() });
+  const users = loadUsers();
+  res.json({ users });
 });
 
 app.post('/api/users/upsert', requireAuth, (req,res)=>{
@@ -368,13 +188,12 @@ app.post('/api/users/upsert', requireAuth, (req,res)=>{
   if (!username) return res.status(400).json({error:'missing username'});
   if (role && !['admin','seller'].includes(role)) return res.status(400).json({error:'bad role'});
   if (botId && !BOT_IDS.includes(botId)) return res.status(400).json({error:'bad botId'});
-
   const users = loadUsers();
   const cur = users[username] || {};
   users[username] = {
     role: role || cur.role || 'seller',
     botId: (role==='admin') ? '*' : (botId || cur.botId || 'v1'),
-    pass: (password && String(password).trim()) ? String(password).trim() : (cur.pass || cur.password || '123')
+    pass: (password && String(password).trim()) ? String(password).trim() : (cur.pass || cur.pass || cur.password || '123')
   };
   saveUsers(users);
   res.json({ ok:true });
@@ -390,505 +209,1009 @@ app.post('/api/users/delete', requireAuth, (req,res)=>{
   res.json({ ok:true });
 });
 
-// Scheduler API
-app.get('/api/schedules', requireAuth, (req,res)=>{
-  const arr = loadSchedules();
-  const allowed = allowedBotIds(req.user);
-  const out = (req.user.role === 'admin') ? arr : arr.filter(j => allowed.includes(j.botId));
-  res.json({ jobs: out.sort((a,b)=>Number(b.runAt||0)-Number(a.runAt||0)) });
+// ------- app -------
+
+
+// ------- auth -------
+app.get('/login', (req,res)=>{
+  const html = `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Login</title>
+  <style>
+    body{margin:0;background:#0b1220;color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;}
+    .wrap{max-width:420px;margin:0 auto;padding:26px 14px}
+    .card{background:#0f172a;border:1px solid #1f2a44;border-radius:16px;padding:16px}
+    h1{margin:0 0 10px 0;font-size:18px}
+    label{display:block;margin:10px 0 6px;color:#94a3b8;font-size:12px}
+    input{width:100%;box-sizing:border-box;background:#0b1220;color:#e5e7eb;border:1px solid #1f2a44;border-radius:12px;padding:10px 12px;font-size:14px}
+    button{width:100%;margin-top:12px;background:#facc15;color:#111827;border:none;border-radius:14px;padding:12px 14px;font-weight:800;font-size:14px;cursor:pointer}
+    .muted{color:#94a3b8;font-size:12px;margin-top:10px}
+  </style></head><body>
+  <div class="wrap"><div class="card">
+    <h1>🔐 Login · Iron Glass MultiBot</h1>
+    <form method="POST" action="/login">
+      <label>Usuário</label><input name="username" placeholder="admin / v1 / v2 ..." required/>
+      <label>Senha</label><input name="password" type="password" required/>
+      <button type="submit">Entrar</button>
+      <div class="muted">Dica: admin/admin123 · v1/123 ... (mude em data/users.json)</div>
+    </form>
+  </div></div></body></html>`;
+  res.send(html);
 });
 
-app.post('/api/schedules/add', requireAuth, (req,res)=>{
-  const { botId, phone, text, runAt } = req.body || {};
-  const selected = getSelectedBotId({ user: req.user, query: { botId } });
-  const allowed = allowedBotIds(req.user);
-  if (req.user.role !== 'admin' && !allowed.includes(selected)) return res.status(403).json({ error:'forbidden' });
-
-  const ts = Number(runAt);
-  if (!ts || !phone || !text) return res.status(400).json({ error:'missing fields' });
-
-  const arr = loadSchedules();
-  const job = {
-    id: newId(),
-    type: 'send_text',
-    botId: selected,
-    phone: String(phone),
-    text: String(text),
-    runAt: ts,
-    status: 'pending',
-    createdAt: new Date().toISOString(),
-    createdBy: req.user.username
-  };
-  arr.push(job);
-  saveSchedules(arr);
-  appendEvent({ botId: selected, action: 'scheduled_created', phone: job.phone, jobId: job.id });
-  res.json({ ok:true, job });
+app.post('/login', (req,res)=>{
+  const username = (req.body.username || '').trim();
+  const password = (req.body.password || '').trim();
+  const users = loadUsers();
+  const u = users[username];
+  const stored = (u.pass ?? u.password);
+  if (!u || stored !== password) return res.redirect('/login');
+  req.session.user = { username };
+  res.redirect('/m');
 });
 
-app.post('/api/schedules/delete', requireAuth, (req,res)=>{
-  const { id } = req.body || {};
-  if (!id) return res.status(400).json({ error:'missing id' });
-
-  const arr = loadSchedules();
-  const job = arr.find(j => j.id === id);
-  if (!job) return res.json({ ok:true });
-
-  const allowed = allowedBotIds(req.user);
-  if (req.user.role !== 'admin' && !allowed.includes(job.botId)) return res.status(403).json({ error:'forbidden' });
-
-  saveSchedules(arr.filter(j => j.id !== id));
-  appendEvent({ botId: job.botId, action: 'scheduled_deleted', phone: job.phone, jobId: job.id });
-  res.json({ ok:true });
+app.get('/logout', (req,res)=>{
+  req.session.destroy(()=>res.redirect('/login'));
 });
 
-// ------- PAGES (MOBILE) -------
-
-// Painel
+// ------- mobile panel -------
 app.get('/m', requireAuth, async (req,res)=>{
-  const { botId, allowed, bot } = pickBot(req);
-  const st = bot.getStatus?.() || {};
-  const qrUrl = await qrDataUrlFn(st.qr || null);
+  const botId = getSelectedBotId(req);
+  const bot = bots[botId];
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
 
-  const options = allowed.map(id => `<option value="${id}" ${id===botId?'selected':''}>${id}</option>`).join('');
+  const status = bot.getStatus();
+  const qrUrl = await qrDataUrl(status.qr);
 
-  const bodyHtml = `
+  const body = `
     <div class="card">
-      <div class="row" style="align-items:center;justify-content:space-between">
-        <div class="row" style="align-items:center">
-          <div class="muted">Bot</div>
-          <select onchange="location.href='/m?botId='+this.value">${options}</select>
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <div>
+          <div style="font-size:16px;font-weight:800">Bot: ${htmlEscape(botId.toUpperCase())}</div>
+          <div class="muted">Conectado: <b>${status.connected ? 'SIM ✅' : 'NÃO ❌'}</b> · Funil ativo: <b>${status.enabled ? 'SIM' : 'NÃO'}</b> · Fila: <b>${status.queueSize}</b></div>
         </div>
-        <div class="row">
-          <button class="btn btn-ghost" onclick="toggleConnect('${botId}')">Conectar/Desconectar</button>
-          <button class="btn btn-primary" onclick="toggleEnabled('${botId}')">Ativar/Pausar</button>
-        </div>
+        ${req.user.role === 'admin' ? `
+        <form method="GET" action="/m" style="min-width:140px">
+          <label>Ver bot</label>
+          <select name="botId" onchange="this.form.submit()">
+            ${BOT_IDS.map(id=>`<option value="${id}" ${id===botId?'selected':''}>${id.toUpperCase()}</option>`).join('')}
+          </select>
+        </form>` : ``}
       </div>
-
-      <div class="muted" style="margin-top:10px">
-        Conexão: <b>${st.connected ? 'Conectado' : 'Desconectado'}</b> ·
-        Bot: <b>${st.enabled ? 'Ativo' : 'Pausado'}</b> ·
-        Fila: <b>${st.queueSize ?? 0}</b>
+      <div class="row" style="margin-top:10px">
+        <form method="POST" action="/m/toggle-connect${req.user.role==='admin'?`?botId=${botId}`:''}">
+          <button class="btn ${status.connected ? 'btn-danger':'btn-primary'}" type="submit">${status.connected ? 'Desconectar' : 'Conectar (gerar QR)'}</button>
+        </form>
+        <form method="POST" action="/m/toggle-enabled${req.user.role==='admin'?`?botId=${botId}`:''}">
+          <button class="btn ${status.enabled ? 'btn-ghost':'btn-ok'}" type="submit">${status.enabled ? '⏸️ Pausar funil/envios' : '▶️ Ativar funil/envios'}</button>
+        </form>
       </div>
-
-      <div class="card" style="margin-top:12px">
-        <div class="muted">QR Code</div>
-        <div class="qr" style="margin-top:10px">
-          ${qrUrl ? `<img src="${qrUrl}" alt="QR"/>` : `<div class="muted">Sem QR agora.</div>`}
-        </div>
-        <div id="connectErr" class="muted" style="margin-top:10px"></div>
-      </div>
+      ${status.connected ? '' : (qrUrl ? `<div class="qr" style="margin-top:12px"><img src="${qrUrl}"/></div>
+      <div class="muted" style="margin-top:8px;text-align:center">WhatsApp → Dispositivos conectados → Conectar</div>` :
+      `<div class="muted" style="margin-top:12px">Clique em “Conectar” para gerar QR.</div>`)}
     </div>
 
-    <script>
-      async function postJSON(url, body){
-        const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
-        const j = await r.json().catch(()=>({}));
-        if(!r.ok){ throw new Error(j.error || 'erro'); }
-        return j;
-      }
-      async function toggleConnect(botId){
-        try{
-          await postJSON('/api/toggle-connect',{botId});
-          location.reload();
-        }catch(e){
-          document.getElementById('connectErr').textContent = 'Erro ao conectar: ' + e.message;
-        }
-      }
-      async function toggleEnabled(botId){
-        try{
-          await postJSON('/api/toggle-enabled',{botId});
-          location.reload();
-        }catch(e){
-          alert(e.message);
-        }
-      }
-    </script>
+    <div class="card">
+      <div style="font-weight:800;margin-bottom:6px">Ações rápidas</div>
+      <div class="muted">Use para controlar contatos sem precisar digitar comandos no WhatsApp.</div>
+      <form method="POST" action="/m/action${req.user.role==='admin'?`?botId=${botId}`:''}">
+        <label>Número do cliente</label>
+        <input name="phone" placeholder="5511999999999" required/>
+        <div class="grid2">
+          <div>
+            <label>Ação</label>
+            <select name="action">
+              <option value="pause72">Pausar 72h</option>
+              <option value="remove">Sacar do funil</option>
+              <option value="botOff24">Bot OFF 24h</option>
+              <option value="block">Bloquear definitivo</option>
+              <option value="markClient">Marcar como cliente (pós-venda)</option>
+            </select>
+          </div>
+          <div>
+            <label>Motivo (opcional)</label>
+            <input name="reason" placeholder="ex: pediu para parar"/>
+          </div>
+        </div>
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Executar</button>
+      </form>
+    </div>
   `;
-
-  renderPage(req,res,{ title:`Painel (${botId})`, bodyHtml });
+  res.send(layoutMobile({ title:'Painel', user:req.user, bodyHtml: body }));
 });
 
-// Mensagens
+app.post('/m/toggle-connect', requireAuth, async (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const st = bot.getStatus();
+  if (st.connected) await bot.disconnect(); else await bot.connect();
+  res.redirect(`/m${req.user.role==='admin'?`?botId=${botId}`:''}`);
+});
+
+app.post('/m/toggle-enabled', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const st = bot.getStatus();
+  bot.setEnabled(!st.enabled);
+  res.redirect(`/m${req.user.role==='admin'?`?botId=${botId}`:''}`);
+});
+
+app.post('/m/action', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+
+  const phoneRaw = (req.body.phone || '').replace(/\D/g,'');
+  if (!phoneRaw) return res.redirect(`/m${req.user.role==='admin'?`?botId=${botId}`:''}`);
+  const phone = phoneRaw.startsWith('55') ? phoneRaw : ('55'+phoneRaw);
+  const jid = phone + '@s.whatsapp.net';
+
+  const action = req.body.action;
+  const reason = req.body.reason || '';
+
+  if (action === 'pause72') bot.pauseFollowUp(jid, 72*60*60*1000);
+  if (action === 'remove') bot.stopFollowUp(jid);
+  if (action === 'botOff24') bot.setManualOff(jid, 24*60*60*1000);
+  if (action === 'block') bot.blockFollowUp(jid, phone, reason || 'manual_panel');
+  if (action === 'markClient') bot.markAsClient(jid);
+
+  appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'panel_action', panelUser:req.user.username, target: phone, kind: action, reason });
+  res.redirect(`/m${req.user.role==='admin'?`?botId=${botId}`:''}`);
+});
+
+// ------- messages -------
 app.get('/m/messages', requireAuth, (req,res)=>{
-  const { botId, bot } = pickBot(req);
-  const cfg = bot.getConfig?.() || {};
-  const bodyHtml = `
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const snap = bot.getDataSnapshot();
+  const m = snap.messagesConfig || {};
+
+  const fields = ['step0','step1','step2','step3','extra','postSale30','agenda0','agenda1','agenda2','confirmTemplate'];
+
+  const body = `
     <div class="card">
-      <h3>📝 Mensagens (${htmlEscape(botId)})</h3>
-      <div class="muted">Edite o JSON.</div>
-      <form method="POST" action="/save">
-        <input type="hidden" name="botId" value="${htmlEscape(botId)}"/>
-        <label>Messages (JSON)</label>
-        <textarea name="messages">${htmlEscape(JSON.stringify(cfg.messages || {}, null, 2))}</textarea>
+      <div style="font-weight:800">Mensagens (${htmlEscape(botId.toUpperCase())})</div>
+      <div class="muted">Cada vendedor ajusta suas próprias mensagens.</div>
+      <form method="POST" action="/m/messages${req.user.role==='admin'?`?botId=${botId}`:''}">
+        ${fields.map(k=>`
+          <label>${k}</label>
+          <textarea name="${k}">${htmlEscape(m[k] || '')}</textarea>
+        `).join('')}
         <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Salvar</button>
+      </form>
+    </div>`;
+  res.send(layoutMobile({ title:'Mensagens', user:req.user, bodyHtml: body }));
+});
+
+app.post('/m/messages', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+
+  bot.updateMessages(req.body || {});
+  appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'update_messages', panelUser:req.user.username });
+  res.redirect(`/m/messages${req.user.role==='admin'?`?botId=${botId}`:''}`);
+});
+
+// ------- agenda (confirmación + lembretes) -------
+function formatPhoneKey(phoneRaw){
+  const digits = String(phoneRaw || '').replace(/\D/g,'');
+  if (!digits) return '';
+  return digits.startsWith('55') ? digits : ('55' + digits);
+}
+
+function listAgendasForBot(snap){
+  const agendas = snap.agendas || {};
+  const rows = [];
+  for (const [jid, arr] of Object.entries(agendas)) {
+    if (!Array.isArray(arr) || arr.length === 0) continue;
+    const phone = jid.replace('@s.whatsapp.net','').replace(/^55/,'');
+    const sorted = [...arr].sort((a,b)=>a.at-b.at);
+    const next = sorted[0];
+    rows.push({ jid, phone, nextAt: next.at, count: sorted.length, keys: sorted.map(x=>x.key).join(', ') });
+  }
+  rows.sort((a,b)=>a.nextAt-b.nextAt);
+  return rows;
+}
+
+function listProgramadosForBot(snap){
+  const program = snap.scheduledStarts || {};
+  const rows = [];
+  for (const [jid, s] of Object.entries(program)) {
+    if (!s || !s.at) continue;
+    const phone = jid.replace('@s.whatsapp.net','').replace(/^55/,'');
+    rows.push({ jid, phone, at: s.at, preview: (s.text||'').slice(0,90) });
+  }
+  rows.sort((a,b)=>a.at-b.at);
+  return rows;
+}
+
+app.get('/m/agenda', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const snap = bot.getDataSnapshot();
+  const m = snap.messagesConfig || {};
+  const agendasRows = listAgendasForBot(snap);
+
+  const table = agendasRows.length ? `
+    <div class="card">
+      <div style="font-weight:800;margin-bottom:6px">Agendas confirmadas</div>
+      <div class="muted">Lembretes ativos (7/3/1 dias) para este número.</div>
+      <table style="width:100%">
+        <thead><tr><th>Contato</th><th>Próximo</th><th>#</th><th>Ações</th></tr></thead>
+        <tbody>
+          ${agendasRows.map(r=>{
+            const d = new Date(r.nextAt);
+            const dt = `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+            return `<tr>
+              <td>${htmlEscape(r.phone)}</td>
+              <td>${htmlEscape(dt)}</td>
+              <td>${r.count}</td>
+              <td>
+                <form method="POST" action="/m/agenda/cancel${req.user.role==='admin'?`?botId=${botId}`:''}">
+                  <input type="hidden" name="jid" value="${htmlEscape(r.jid)}"/>
+                  <button class="btn btn-danger" type="submit">Cancelar</button>
+                </form>
+              </td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>` : `<div class="card"><div class="muted">Nenhuma agenda confirmada ainda.</div></div>`;
+
+  const body = `
+    <div class="card">
+      <div style="font-weight:800">Confirmación de agenda (${htmlEscape(botId.toUpperCase())})</div>
+      <div class="muted">Programa lembretes 7/3/1 dias e (opcional) envia confirmação agora.</div>
+
+      <form method="POST" action="/m/agenda${req.user.role==='admin'?`?botId=${botId}`:''}">
+        <label>Número do cliente</label>
+        <input name="phone" placeholder="5511999999999" required/>
+
+        <div class="grid2">
+          <div><label>Dia</label><input name="date" type="date" required/></div>
+          <div><label>Hora</label><input name="time" type="time" required/></div>
+        </div>
+
+        <label>Veículo</label><input name="vehicle" placeholder="Ex: BYD SONG PLUS"/>
+        <label>Produto</label><input name="product" placeholder="Ex: Iron Glass Plus"/>
+        <label>Valor total</label><input name="valor" placeholder="Ex: R$ 12.900,00"/>
+        <label>Sinal recebido</label><input name="sinal" placeholder="Ex: R$ 1.075,00"/>
+        <label>Forma de pagamento</label><input name="pagamento" placeholder="PIX confirmado"/>
+
+        <label style="display:flex;align-items:center;gap:8px;margin-top:10px">
+          <input type="checkbox" name="sendConfirm" /> Enviar confirmação agora
+        </label>
+
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Programar agenda</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:800;margin-bottom:6px">Mensagens de lembrete</div>
+      <div class="muted">Edita os textos de agenda aqui (7/3/1 dias).</div>
+      <form method="POST" action="/m/messages${req.user.role==='admin'?`?botId=${botId}`:''}">
+        <label>agenda0 (7 dias)</label><textarea name="agenda0">${htmlEscape(m.agenda0||'')}</textarea>
+        <label>agenda1 (3 dias)</label><textarea name="agenda1">${htmlEscape(m.agenda1||'')}</textarea>
+        <label>agenda2 (1 dia)</label><textarea name="agenda2">${htmlEscape(m.agenda2||'')}</textarea>
+        <label>confirmTemplate</label><textarea name="confirmTemplate">${htmlEscape(m.confirmTemplate||'')}</textarea>
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Salvar textos de agenda</button>
+      </form>
+    </div>
+
+    ${table}
+  `;
+  res.send(layoutMobile({ title:'Agenda', user:req.user, bodyHtml: body }));
+});
+
+app.post('/m/agenda', requireAuth, async (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+
+  const phoneKey = formatPhoneKey(req.body.phone);
+  const date = req.body.date;
+  const time = req.body.time;
+
+  if (!phoneKey || !date || !time) return res.redirect(`/m/agenda${req.user.role==='admin'?`?botId=${botId}`:''}`);
+
+  const apptTs = new Date(`${date}T${time}:00`).getTime();
+  const d = new Date(apptTs);
+  const data = {
+    DATA: `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`,
+    HORA: `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`,
+    VEICULO: req.body.vehicle || '',
+    PRODUTO: req.body.product || '',
+    VALOR: req.body.valor || '',
+    SINAL: req.body.sinal || '',
+    PAGAMENTO: req.body.pagamento || ''
+  };
+
+  bot.scheduleAgendaFromPanel(phoneKey, date, time, data);
+
+  if (req.body.sendConfirm) {
+    await bot.sendConfirmNow(phoneKey, data);
+  }
+
+  appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'agenda_set', panelUser:req.user.username, phoneKey });
+  res.redirect(`/m/agenda${req.user.role==='admin'?`?botId=${botId}`:''}`);
+});
+
+app.post('/m/agenda/cancel', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const jid = req.body.jid;
+  if (jid) bot.cancelAgenda ? bot.cancelAgenda(jid) : null;
+  appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'agenda_cancel', panelUser:req.user.username, jid });
+  res.redirect(`/m/agenda${req.user.role==='admin'?`?botId=${botId}`:''}`);
+});
+
+// ------- programar (mensagem inicial futura) -------
+app.get('/m/program', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const snap = bot.getDataSnapshot();
+  const rows = listProgramadosForBot(snap);
+
+  const table = rows.length ? `
+    <div class="card">
+      <div style="font-weight:800;margin-bottom:6px">Mensagens programadas</div>
+      <table style="width:100%">
+        <thead><tr><th>Contato</th><th>Quando</th><th>Ações</th></tr></thead>
+        <tbody>
+        ${rows.map(r=>{
+          const d = new Date(r.at);
+          const dt = `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+          return `<tr>
+            <td>${htmlEscape(r.phone)}<div class="muted">${htmlEscape(r.preview)}</div></td>
+            <td>${htmlEscape(dt)}</td>
+            <td>
+              <form method="POST" action="/m/program/cancel${req.user.role==='admin'?`?botId=${botId}`:''}">
+                <input type="hidden" name="jid" value="${htmlEscape(r.jid)}"/>
+                <button class="btn btn-danger" type="submit">Cancelar</button>
+              </form>
+            </td>
+          </tr>`;
+        }).join('')}
+        </tbody>
+      </table>
+    </div>` : `<div class="card"><div class="muted">Nenhuma mensagem programada.</div></div>`;
+
+  const body = `
+    <div class="card">
+      <div style="font-weight:800">Programar mensagem (${htmlEscape(botId.toUpperCase())})</div>
+      <div class="muted">Quando o cliente diz “só posso falar semana que vem”. O bot pausa e envia no dia/hora, depois entra no funil.</div>
+
+      <form method="POST" action="/m/program${req.user.role==='admin'?`?botId=${botId}`:''}">
+        <label>Número do cliente</label>
+        <input name="phone" placeholder="5511999999999" required/>
+        <div class="grid2">
+          <div><label>Dia</label><input name="date" type="date" required/></div>
+          <div><label>Hora</label><input name="time" type="time" value="09:00"/></div>
+        </div>
+        <label>Mensagem</label>
+        <textarea name="text" placeholder="Ex: Oi! Aqui é da Iron Glass, combinamos de falar hoje..."></textarea>
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Programar</button>
+      </form>
+    </div>
+    ${table}
+  `;
+  res.send(layoutMobile({ title:'Programar', user:req.user, bodyHtml: body }));
+});
+
+app.post('/m/program', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+
+  const phoneKey = formatPhoneKey(req.body.phone);
+  const date = req.body.date;
+  const time = req.body.time || '09:00';
+  const text = req.body.text || '';
+
+  if (!phoneKey || !date) return res.redirect(`/m/program${req.user.role==='admin'?`?botId=${botId}`:''}`);
+
+  bot.programStartMessage(phoneKey, date, time, text);
+  appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'program_set', panelUser:req.user.username, phoneKey });
+  res.redirect(`/m/program${req.user.role==='admin'?`?botId=${botId}`:''}`);
+});
+
+app.post('/m/program/cancel', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const jid = req.body.jid;
+  const snap = bot.getDataSnapshot();
+  if (jid && snap.scheduledStarts && snap.scheduledStarts[jid]) {
+    delete snap.scheduledStarts[jid];
+    const file = require('path').join(__dirname, 'data', botId, 'programados.json');
+    require('./src/utils').saveJSON(file, snap.scheduledStarts);
+  }
+  appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'program_cancel', panelUser:req.user.username, jid });
+  res.redirect(`/m/program${req.user.role==='admin'?`?botId=${botId}`:''}`);
+});
+
+
+
+
+
+// ------- cotizar -------
+app.get('/m/quote', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const snap = bot.getDataSnapshot();
+  const q = snap.quotesConfig || {};
+  const body = `
+    <div class="card">
+      <div style="font-weight:800">Enviar cotização (${htmlEscape(botId.toUpperCase())})</div>
+      <div class="muted">Envia uma cotização manual agora e salva no histórico do lead.</div>
+      <form method="POST" action="/m/quote${req.user.role==='admin'?`?botId=${botId}`:''}">
+        <label>Número do cliente</label>
+        <input name="phone" placeholder="5511999999999" required />
+        <label>Veículo (modelo)</label>
+        <input name="vehicle" placeholder="Ex: BYD SONG PLUS" />
+        <label>Ano</label>
+        <input name="year" type="number" placeholder="2024" />
+        <label>Produto</label>
+        <select name="productKey">
+          <option value="ironGlass">Iron Glass</option>
+          <option value="ironGlassPlus" selected>Iron Glass Plus</option>
+          <option value="defender">Defender</option>
+        </select>
+        <label>Valor</label>
+        <input name="value" placeholder="R$ 12.900,00" />
+        <label>Pagamento</label>
+        <input name="payment" placeholder="12x / PIX / cartão" />
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Enviar cotização</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:800;margin-bottom:6px">Templates (editáveis)</div>
+      <div class="muted">Variáveis: {{VEICULO}}, {{ANO}}, {{VALOR}}, {{PAGAMENTO}}</div>
+      <form method="POST" action="/m/quote/templates${req.user.role==='admin'?`?botId=${botId}`:''}">
+        <label>Iron Glass</label>
+        <textarea name="ironGlass_template">${htmlEscape(q.ironGlass?.template || '')}</textarea>
+        <label>Iron Glass Plus</label>
+        <textarea name="ironGlassPlus_template">${htmlEscape(q.ironGlassPlus?.template || '')}</textarea>
+        <label>Defender</label>
+        <textarea name="defender_template">${htmlEscape(q.defender?.template || '')}</textarea>
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Salvar templates</button>
       </form>
     </div>
   `;
-  renderPage(req,res,{ title:`Mensagens (${botId})`, bodyHtml });
+  res.send(layoutMobile({ title:'Cotizar', user:req.user, bodyHtml: body }));
 });
 
-// Regras
-app.get('/m/rules', requireAuth, (req,res)=>{
-  const { botId, bot } = pickBot(req);
-  const cfg = bot.getConfig?.() || {};
-  const bodyHtml = `
-    <div class="card">
-      <h3>⚙️ Regras (${htmlEscape(botId)})</h3>
-      <form method="POST" action="/save">
-        <input type="hidden" name="botId" value="${htmlEscape(botId)}"/>
-        <label>Rules (JSON)</label>
-        <textarea name="rules">${htmlEscape(JSON.stringify(cfg.rules || {}, null, 2))}</textarea>
-        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Salvar</button>
-      </form>
-    </div>
-  `;
-  renderPage(req,res,{ title:`Regras (${botId})`, bodyHtml });
+app.post('/m/quote', requireAuth, async (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+
+  const phoneKey = String(req.body.phone||'').replace(/\D/g,'');
+  if (!phoneKey) return res.redirect(`/m/quote${req.user.role==='admin'?`?botId=${botId}`:''}`);
+  const pk = phoneKey.startsWith('55') ? phoneKey : ('55'+phoneKey);
+
+  const payload = {
+    productKey: req.body.productKey || 'ironGlassPlus',
+    vehicle: req.body.vehicle || '',
+    year: Number(req.body.year||'') || '',
+    value: req.body.value || '',
+    payment: req.body.payment || ''
+  };
+
+  const out = await bot.sendQuoteNow(pk, payload);
+  appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'quote_sent', panelUser:req.user.username, phoneKey: pk, payload });
+  res.redirect(`/m/leads${req.user.role==='admin'?`?botId=${botId}`:''}`);
 });
 
-// Save config (rules/messages)
-app.post('/save', requireAuth, (req,res)=>{
-  const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
-  const b = getBot(botId);
+app.post('/m/quote/templates', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const snap = bot.getDataSnapshot();
+  const q = snap.quotesConfig || {};
 
-  const cfg = b.getConfig?.() || {};
-  const rulesOld = cfg.rules || {};
-  const messagesOld = cfg.messages || {};
-
-  const rulesNew = safeJSONParse(req.body.rules, rulesOld);
-  const messagesNew = safeJSONParse(req.body.messages, messagesOld);
-
-  try { b.setConfig?.({ rules: rulesNew, messages: messagesNew }); } catch(_) {}
-  res.redirect(req.headers.referer || '/m');
+  const next = {
+    ironGlass: { ...(q.ironGlass||{}), template: req.body.ironGlass_template || (q.ironGlass?.template||'') },
+    ironGlassPlus: { ...(q.ironGlassPlus||{}), template: req.body.ironGlassPlus_template || (q.ironGlassPlus?.template||'') },
+    defender: { ...(q.defender||{}), template: req.body.defender_template || (q.defender?.template||'') }
+  };
+  bot.updateQuotes(next);
+  appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'quote_templates_update', panelUser:req.user.username });
+  res.redirect(`/m/quote${req.user.role==='admin'?`?botId=${botId}`:''}`);
 });
 
-// Leads
+// ------- leads / pipeline -------
+function stageLabel(s){
+  const m = { novo:'Novo', em_negociacao:'Em negociação', cotizado:'Cotizado', agendado:'Agendado', fechado:'Fechado', perdido:'Perdido', programado:'Programado' };
+  return m[s] || s || 'Novo';
+}
+
 app.get('/m/leads', requireAuth, (req,res)=>{
-  const { botId, bot } = pickBot(req);
-  const leads = bot.getLeads?.() || {};
-  const rows = Object.entries(leads).slice(0, 300).map(([id, l]) => {
-    const name = l.name || l.nome || '';
-    const phone = l.phone || l.telefone || id;
-    const year = l.year || l.ano || '';
-    const stage = l.stage || l.funil || l.status || '';
-    return `<tr>
-      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(phone)}</td>
-      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(name)}</td>
-      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(year)}</td>
-      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(stage)}</td>
-    </tr>`;
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const snap = bot.getDataSnapshot();
+  const leads = Object.values(snap.leads || {});
+  const q = String(req.query.q||'').trim();
+  const stage = String(req.query.stage||'').trim();
+
+  let filtered = leads;
+  if (q) filtered = filtered.filter(l => (l.phoneKey||'').includes(q) || (l.model||'').toLowerCase().includes(q.toLowerCase()));
+  if (stage) filtered = filtered.filter(l => (l.stage||'novo') === stage);
+
+  filtered.sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0));
+
+  const rows = filtered.slice(0, 200).map(l=>{
+    const phone = String(l.phoneKey||'').replace(/^55/,'');
+    const st = l.stage || 'novo';
+    const last = l.lastInboundAt ? new Date(l.lastInboundAt).toLocaleString() : '-';
+    return `<a class="row" href="/m/lead?jid=${encodeURIComponent(l.jid)}${req.user.role==='admin'?`&botId=${botId}`:''}">
+      <div style="font-weight:800">${htmlEscape(phone)} <span class="pill">${htmlEscape(stageLabel(st))}</span></div>
+      <div class="muted">${htmlEscape((l.model||'') + (l.year?(' • '+l.year):''))}</div>
+      <div class="muted">Último inbound: ${htmlEscape(last)}</div>
+    </a>`;
   }).join('');
 
-  const bodyHtml = `
+  const body = `
     <div class="card">
-      <h3>👥 Leads (${htmlEscape(botId)})</h3>
-      <div class="muted">Mostrando até 300.</div>
-      <div style="overflow:auto;margin-top:10px">
-        <table style="width:100%;border-collapse:collapse">
-          <thead>
-            <tr style="color:#94a3b8;font-size:12px;text-align:left">
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Telefone</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Nome</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Ano</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Etapa</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${rows || `<tr><td colspan="4" class="muted" style="padding:10px">Sem leads (ou getLeads não existe).</td></tr>`}
-          </tbody>
-        </table>
-      </div>
+      <div style="font-weight:800">Leads (${htmlEscape(botId.toUpperCase())})</div>
+      <form method="GET" action="/m/leads" style="margin-top:10px">
+        ${req.user.role==='admin'?`<input type="hidden" name="botId" value="${htmlEscape(botId)}"/>`:''}
+        <label>Buscar (telefone ou modelo)</label>
+        <input name="q" value="${htmlEscape(q)}" placeholder="119999... / song / compass" />
+        <label>Stage</label>
+        <select name="stage">
+          <option value="">Todos</option>
+          <option value="novo">Novo</option>
+          <option value="em_negociacao">Em negociação</option>
+          <option value="cotizado">Cotizado</option>
+          <option value="agendado">Agendado</option>
+          <option value="fechado">Fechado</option>
+          <option value="perdido">Perdido</option>
+          <option value="programado">Programado</option>
+        </select>
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Filtrar</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="muted">Mostrando até 200 leads (ordenado por atualização).</div>
+      ${rows || '<div class="muted">Nenhum lead ainda.</div>'}
     </div>
   `;
-  renderPage(req,res,{ title:`Leads (${botId})`, bodyHtml });
+  res.send(layoutMobile({ title:'Leads', user:req.user, bodyHtml: body }));
 });
 
-// Dashboard
+app.get('/m/lead', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const snap = bot.getDataSnapshot();
+  const jid = String(req.query.jid||'');
+  const lead = snap.leads?.[jid] || null;
+  if (!lead) return res.redirect(`/m/leads${req.user.role==='admin'?`?botId=${botId}`:''}`);
+  const phone = String(lead.phoneKey||'').replace(/^55/,'');
+  const st = lead.stage || 'novo';
+
+  const body = `
+    <div class="card">
+      <div style="font-weight:800">Lead ${htmlEscape(phone)} (${htmlEscape(botId.toUpperCase())})</div>
+      <div class="muted">${htmlEscape((lead.model||'') + (lead.year?(' • '+lead.year):''))}</div>
+      <form method="POST" action="/m/lead${req.user.role==='admin'?`?botId=${botId}`:''}">
+        <input type="hidden" name="jid" value="${htmlEscape(jid)}"/>
+        <label>Nome</label>
+        <input name="name" value="${htmlEscape(lead.name||'')}" placeholder="Nome do cliente" />
+        <label>Tags (separadas por vírgula)</label>
+        <input name="tags" value="${htmlEscape((lead.tags||[]).join(', '))}" placeholder="ex: shopping, indicação" />
+        <label>Stage</label>
+        <select name="stage">
+          ${['novo','em_negociacao','cotizado','agendado','fechado','perdido','programado'].map(s=>`<option value="${s}" ${s===st?'selected':''}>${stageLabel(s)}</option>`).join('')}
+        </select>
+        <label>Notas</label>
+        <textarea name="notes" placeholder="Observações do vendedor">${htmlEscape(lead.notes||'')}</textarea>
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Salvar lead</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:800;margin-bottom:6px">Ações rápidas</div>
+      <form method="POST" action="/m/action${req.user.role==='admin'?`?botId=${botId}`:''}">
+        <input type="hidden" name="jid" value="${htmlEscape(jid)}"/>
+        <button class="btn" name="action" value="markClient" type="submit" style="width:100%">Marcar como cliente (pós-venda)</button>
+      </form>
+    </div>
+  `;
+  res.send(layoutMobile({ title:'Lead', user:req.user, bodyHtml: body }));
+});
+
+app.post('/m/lead', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+
+  const jid = req.body.jid;
+  const tags = String(req.body.tags||'').split(',').map(s=>s.trim()).filter(Boolean);
+  const stage = req.body.stage || 'novo';
+  const patch = { name: req.body.name || '', tags, stage, notes: req.body.notes || '' };
+  bot.updateLead(jid, patch);
+  appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'lead_update', panelUser:req.user.username, jid, patch });
+  res.redirect(`/m/lead?jid=${encodeURIComponent(jid)}${req.user.role==='admin'?`&botId=${botId}`:''}`);
+});
+
+// ------- dashboard -------
 app.get('/m/dashboard', requireAuth, (req,res)=>{
-  const { botId } = pickBot(req);
-  const bodyHtml = `
-    <div class="card">
-      <h3>📈 Dashboard (${htmlEscape(botId)})</h3>
-      <div id="dashBox" class="muted" style="margin-top:10px">Carregando…</div>
-    </div>
-    <script>
-      (async ()=>{
-        const r = await fetch('/api/stats?botId=${encodeURIComponent(botId)}');
-        const j = await r.json();
-        document.getElementById('dashBox').innerHTML =
-          '<b>Mensagens auto:</b> ' + (j.totalMessagesSent ?? 0) + '<br>' +
-          '<b>Ano mínimo:</b> ' + (j.minYearFollowUp ?? '-') + '<br>' +
-          '<b>Carros abaixo:</b> ' + (j.carsBelowMinYear ?? 0) + '<br>' +
-          '<b>Carros OK:</b> ' + (j.carsAtOrAboveMinYear ?? 0);
-      })();
-    </script>
-  `;
-  renderPage(req,res,{ title:`Dashboard (${botId})`, bodyHtml });
-});
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const snap = bot.getDataSnapshot();
+  const leads = Object.values(snap.leads || {});
+  const byStage = {};
+  for (const l of leads) {
+    const s = l.stage || 'novo';
+    byStage[s] = (byStage[s]||0) + 1;
+  }
 
-// Estatísticas
-app.get('/m/stats', requireAuth, (req,res)=>{
-  const { botId } = pickBot(req);
-  const bodyHtml = `
+  const stages = ['novo','em_negociacao','cotizado','agendado','fechado','perdido','programado'];
+  const cards = stages.map(s=>`
     <div class="card">
-      <h3>📊 Estatísticas (${htmlEscape(botId)})</h3>
-      <div id="statsFull" class="muted" style="margin-top:10px">Carregando…</div>
-    </div>
-    <script>
-      (async ()=>{
-        const r = await fetch('/api/stats?botId=${encodeURIComponent(botId)}');
-        const j = await r.json();
-        document.getElementById('statsFull').innerHTML =
-          '<b>Mensagens auto:</b> ' + (j.totalMessagesSent ?? 0) + '<br>' +
-          '<b>Ano mínimo:</b> ' + (j.minYearFollowUp ?? '-') + '<br>' +
-          '<b>Carros abaixo:</b> ' + (j.carsBelowMinYear ?? 0) + '<br>' +
-          '<b>Carros OK:</b> ' + (j.carsAtOrAboveMinYear ?? 0);
-      })();
-    </script>
-  `;
-  renderPage(req,res,{ title:`Estatísticas (${botId})`, bodyHtml });
-});
+      <div style="font-weight:900;font-size:1.1rem">${byStage[s]||0}</div>
+      <div class="muted">${htmlEscape(stageLabel(s))}</div>
+    </div>`).join('');
 
-// Cotizar
-app.get('/m/quote', requireAuth, (req,res)=>{
-  const { botId } = pickBot(req);
-  const bodyHtml = `
+  // simple conversion metrics
+  const total = leads.length || 0;
+  const ag = byStage['agendado']||0;
+  const fe = byStage['fechado']||0;
+  const ct = byStage['cotizado']||0;
+
+  const body = `
     <div class="card">
-      <h3>💰 Cotizar (${htmlEscape(botId)})</h3>
-      <div class="muted">Tela pronta. Se você quer a cotização automática, me manda a lógica antiga/print e eu encaixo aqui.</div>
+      <div style="font-weight:800">Dashboard (${htmlEscape(botId.toUpperCase())})</div>
+      <div class="muted">Resumo por stage (pipeline). Próximo passo: comparar vendedores e meses.</div>
+    </div>
+    <div class="grid2">${cards}</div>
+    <div class="card">
+      <div style="font-weight:800;margin-bottom:6px">Conversão (base atual de leads)</div>
+      <div class="muted">Total leads: ${total}</div>
+      <div class="muted">Cotizados: ${ct} (${total?Math.round((ct/total)*100):0}%)</div>
+      <div class="muted">Agendados: ${ag} (${total?Math.round((ag/total)*100):0}%)</div>
+      <div class="muted">Fechados: ${fe} (${total?Math.round((fe/total)*100):0}%)</div>
     </div>
   `;
-  renderPage(req,res,{ title:`Cotizar (${botId})`, bodyHtml });
+  res.send(layoutMobile({ title:'Dashboard', user:req.user, bodyHtml: body }));
 });
 
-// Comandos
+
+// ------- commands -------
 app.get('/m/commands', requireAuth, (req,res)=>{
-  const { botId } = pickBot(req);
-  const bodyHtml = `
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const snap = bot.getDataSnapshot();
+  const c = snap.config?.commands || {};
+
+  const body = `
     <div class="card">
-      <h3>⌨️ Comandos (${htmlEscape(botId)})</h3>
-      <pre style="white-space:pre-wrap;word-break:break-word;background:#0b1220;border:1px solid #1f2a44;border-radius:12px;padding:12px;margin-top:10px">
-#okok    -> marcar lead como OK
-#stop    -> parar automação
-#follow  -> voltar para o funil
-#humano  -> transferir para humano
-      </pre>
-    </div>
-  `;
-  renderPage(req,res,{ title:`Comandos (${botId})`, bodyHtml });
+      <div style="font-weight:800">Comandos (${htmlEscape(botId.toUpperCase())})</div>
+      <div class="muted">Editável. Use no WhatsApp (mensagem enviada por você) para acionar ações.</div>
+      <form method="POST" action="/m/commands${req.user.role==='admin'?`?botId=${botId}`:''}">
+        <label>STOP (bloquear definitivo)</label><input name="stop" value="${htmlEscape(c.stop||'')}" />
+        <label>PAUSE (pausar 72h)</label><input name="pause" value="${htmlEscape(c.pause||'')}" />
+        <label>CLIENTE (pós-venda)</label><input name="client" value="${htmlEscape(c.client||'')}" />
+        <label>REMOVE (sacar do funil sem bloquear)</label><input name="remove" value="${htmlEscape(c.remove||'')}" />
+        <label>BOT OFF 24h</label><input name="botOff" value="${htmlEscape(c.botOff||'')}" />
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Salvar comandos</button>
+      </form>
+    </div>`;
+  res.send(layoutMobile({ title:'Comandos', user:req.user, bodyHtml: body }));
 });
 
-// Programar (agenda real)
-app.get('/m/program', requireAuth, (req,res)=>{
-  const { botId, allowed } = pickBot(req);
-  const botOptions = allowed.map(id => `<option value="${id}" ${id===botId?'selected':''}>${id}</option>`).join('');
+app.post('/m/commands', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
 
-  const bodyHtml = `
-  <div class="card">
-    <h3>⏱️ Programar Mensagem</h3>
-    <div class="muted">Agenda um envio automático (salva em data/schedules.json).</div>
+  bot.setCommands(req.body || {});
+  appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'update_commands', panelUser:req.user.username });
+  res.redirect(`/m/commands${req.user.role==='admin'?`?botId=${botId}`:''}`);
+});
 
-    <label>Bot</label>
-    <select id="botIdSel">${botOptions}</select>
+// ------- rules -------
+app.get('/m/rules', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+  const snap = bot.getDataSnapshot();
+  const rules = snap.config?.rules || {};
+  const window = snap.config?.window || {};
+  const limits = snap.config?.limits || {};
 
-    <label>Telefone (com DDD)</label>
-    <input id="phone" placeholder="11 99999-9999" />
-
-    <label>Data e hora</label>
-    <input id="when" type="datetime-local"/>
-
-    <label>Mensagem</label>
-    <textarea id="text" placeholder="Oi! ..."></textarea>
-
-    <div class="row" style="margin-top:10px">
-      <button class="btn btn-primary" onclick="addJob()">Agendar</button>
-      <button class="btn btn-ghost" onclick="loadJobs()">Atualizar lista</button>
-    </div>
-
-    <div id="progErr" class="muted" style="margin-top:10px"></div>
-  </div>
-
-  <div class="card">
-    <h3>📋 Programados</h3>
-    <div id="jobs" class="muted">Carregando…</div>
-  </div>
-
-  <script>
-    function toTs(dtLocal){
-      if(!dtLocal) return null;
-      const d = new Date(dtLocal);
-      const ts = d.getTime();
-      return Number.isFinite(ts) ? ts : null;
-    }
-
-    async function postJSON(url, body){
-      const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
-      const j = await r.json().catch(()=>({}));
-      if(!r.ok){ throw new Error(j.error || 'erro'); }
-      return j;
-    }
-
-    async function loadJobs(){
-      const r = await fetch('/api/schedules');
-      const j = await r.json();
-      const rows = (j.jobs||[]).slice(0,200).map(x=>{
-        const dt = x.runAt ? new Date(Number(x.runAt)).toLocaleString('pt-BR') : '-';
-        const st = x.status || '-';
-        const err = x.error ? (' · erro: ' + x.error) : '';
-        return \`
-          <div style="border-top:1px solid #1f2a44;padding:10px 0">
-            <div><b>\${dt}</b> · <span class="muted">bot</span> <b>\${x.botId}</b> · <span class="muted">fone</span> <b>\${x.phone}</b></div>
-            <div class="muted">status: <b>\${st}</b>\${err}</div>
-            <div style="margin-top:6px;white-space:pre-wrap">\${(x.text||'').replace(/</g,'&lt;')}</div>
-            <div style="margin-top:8px">
-              <button class="btn btn-danger" onclick="delJob('\${x.id}')">Apagar</button>
-            </div>
+  const body = `
+    <div class="card">
+      <div style="font-weight:800">Regras (${htmlEscape(botId.toUpperCase())})</div>
+      <form method="POST" action="/m/rules${req.user.role==='admin'?`?botId=${botId}`:''}">
+        <label>Ano mínimo para fazer funil</label>
+        <input name="minYearFollowUp" type="number" value="${htmlEscape(rules.minYearFollowUp ?? 2022)}"/>
+        <div class="grid2">
+          <div>
+            <label>Janela início (hora)</label>
+            <input name="startHour" type="number" value="${htmlEscape(window.startHour ?? 9)}"/>
           </div>
-        \`;
-      }).join('');
-      document.getElementById('jobs').innerHTML = rows || '<div class="muted">Nenhum agendamento.</div>';
-    }
-
-    async function addJob(){
-      document.getElementById('progErr').textContent = '';
-      try{
-        const botId = document.getElementById('botIdSel').value;
-        const phone = document.getElementById('phone').value;
-        const text = document.getElementById('text').value;
-        const when = document.getElementById('when').value;
-        const runAt = toTs(when);
-        await postJSON('/api/schedules/add',{ botId, phone, text, runAt });
-        document.getElementById('text').value = '';
-        await loadJobs();
-      }catch(e){
-        document.getElementById('progErr').textContent = 'Erro: ' + e.message;
-      }
-    }
-
-    async function delJob(id){
-      await postJSON('/api/schedules/delete',{ id });
-      await loadJobs();
-    }
-
-    loadJobs();
-  </script>
-  `;
-  renderPage(req,res,{ title:`Programar (${botId})`, bodyHtml });
+          <div>
+            <label>Janela fim (hora)</label>
+            <input name="endHour" type="number" value="${htmlEscape(window.endHour ?? 22)}"/>
+          </div>
+        </div>
+        <div class="grid2">
+          <div><label>Limite por minuto</label><input name="perMinute" type="number" value="${htmlEscape(limits.perMinute ?? 8)}"/></div>
+          <div><label>Limite por hora</label><input name="perHour" type="number" value="${htmlEscape(limits.perHour ?? 120)}"/></div>
+          <div><label>Limite por dia</label><input name="perDay" type="number" value="${htmlEscape(limits.perDay ?? 400)}"/></div>
+          <div><label>Por contato/dia</label><input name="perContactPerDay" type="number" value="${htmlEscape(limits.perContactPerDay ?? 2)}"/></div>
+        </div>
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Salvar regras</button>
+      </form>
+      <div class="muted" style="margin-top:10px">Se ano detectado &lt; mínimo: não entra no funil, mas registra estatística em events.json.</div>
+    </div>`;
+  res.send(layoutMobile({ title:'Regras', user:req.user, bodyHtml: body }));
 });
 
-// Agenda (misma lista con refresh)
-app.get('/m/agenda', requireAuth, (req,res)=>{
-  const { botId } = pickBot(req);
-  const bodyHtml = `
+app.post('/m/rules', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
+  const bot = bots[botId];
+
+  const minYearFollowUp = Number(req.body.minYearFollowUp || 2022);
+  const startHour = Number(req.body.startHour || 9);
+  const endHour = Number(req.body.endHour || 22);
+
+  bot.updateConfig({
+    rules: { minYearFollowUp },
+    window: { startHour, endHour },
+    limits: {
+      perMinute: Number(req.body.perMinute || 8),
+      perHour: Number(req.body.perHour || 120),
+      perDay: Number(req.body.perDay || 400),
+      perContactPerDay: Number(req.body.perContactPerDay || 2),
+    }
+  });
+
+  appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'update_rules', panelUser:req.user.username });
+  res.redirect(`/m/rules${req.user.role==='admin'?`?botId=${botId}`:''}`);
+});
+
+// ------- stats -------
+function inRange(ts, fromTs, toTs) {
+  if (fromTs && ts < fromTs) return false;
+  if (toTs && ts > toTs) return false;
+  return true;
+}
+app.get('/m/stats', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId(req);
+  if (!allowedBotIds(req.user).includes(botId) && req.user.role !== 'admin') return res.status(403).send('forbidden');
+
+  const from = req.query.from || '';
+  const to = req.query.to || '';
+  const fromTs = from ? new Date(from + 'T00:00:00').getTime() : null;
+  const toTs = to ? new Date(to + 'T23:59:59').getTime() : null;
+
+  const events = loadJSON(EVENTS_FILE, []);
+  const rows = events
+    .filter(e => e.action === 'inbound_message')
+    .filter(e => req.user.role === 'admin' ? (botId ? e.botId === botId : true) : e.botId === botId)
+    .filter(e => inRange(Number(e.ts||0), fromTs, toTs));
+
+  
+  const rulesK = bots[botId].getConfig()?.rules || { minYearFollowUp: 2022 };
+  const minYearK = Number(rulesK.minYearFollowUp || 2022);
+  const leadsK = bots[botId].getLeads();
+  let belowK=0, aboveK=0;
+  for (const lead of Object.values(leadsK||{})) {
+    const y = Number(lead.year||0);
+    if (!y) continue;
+    if (y < minYearK) belowK++; else aboveK++;
+  }
+  const eventsK = loadJSON(EVENTS_FILE, []);
+  const sentK = eventsK.filter(e=>e.botId=== botId && e.action==='auto_sent').length;
+
+const byYear = {};
+  const byModel = {};
+  for (const e of rows) {
+    const y = e.year || 'SEM_ANO';
+    byYear[y] = (byYear[y] || 0) + 1;
+    const m = e.model || 'SEM_MODELO';
+    byModel[m] = (byModel[m] || 0) + 1;
+  }
+
+  const yearTable = Object.entries(byYear).sort((a,b)=>String(a[0]).localeCompare(String(b[0]))).map(([k,v])=>`<tr><td>${htmlEscape(k)}</td><td>${v}</td></tr>`).join('');
+  const modelTable = Object.entries(byModel).sort((a,b)=>b[1]-a[1]).slice(0,30).map(([k,v])=>`<tr><td>${htmlEscape(k)}</td><td>${v}</td></tr>`).join('');
+
+  const body = `
     <div class="card">
-      <h3>🗓️ Agenda</h3>
-      <div class="muted">Pendentes / Done / Error (atualiza a cada 15s).</div>
-      <div style="margin-top:10px">
-        <a class="btn btn-primary" href="/m/program">Ir para Programar</a>
+      <div style="font-weight:800">Estatísticas (${htmlEscape(botId.toUpperCase())})</div>
+      <div class="muted">Filtra por período e mostra quantos clientes escreveram por ano/modelo (quando detectado).</div>
+      <form method="GET" action="/m/stats">
+        ${req.user.role==='admin' ? `
+        <label>Bot</label>
+        <select name="botId">
+          ${BOT_IDS.map(id=>`<option value="${id}" ${id===botId?'selected':''}>${id.toUpperCase()}</option>`).join('')}
+        </select>` : ``}
+        <div class="grid2">
+          <div><label>De</label><input name="from" type="date" value="${htmlEscape(from)}"/></div>
+          <div><label>Até</label><input name="to" type="date" value="${htmlEscape(to)}"/></div>
+        </div>
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Aplicar</button>
+      </form>
+
+      <div class="card" style="border:1px solid rgba(250,204,21,.25)">
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+          <div><div class="muted">Mensagens (auto, total)</div><div style="font-size:22px;font-weight:900">${sentK}</div></div>
+          <div><div class="muted">Carros &lt; ${minYearK}</div><div style="font-size:22px;font-weight:900">${belowK}</div></div>
+          <div><div class="muted">Carros ≥ ${minYearK}</div><div style="font-size:22px;font-weight:900">${aboveK}</div></div>
+        </div>
+        <div class="muted" style="margin-top:6px">Ano mínimo vem de <b>Regras</b> (mude lá e isso atualiza automaticamente).</div>
       </div>
+
+      <div class="muted" style="margin-top:10px">Total mensagens inbound no período: <b>${rows.length}</b></div>
     </div>
+
     <div class="card">
-      <h3>📋 Lista</h3>
-      <div id="jobs" class="muted">Carregando…</div>
+      <div style="font-weight:800;margin-bottom:6px">Por ano</div>
+      <table style="width:100%"><thead><tr><th>Ano</th><th>Qtd</th></tr></thead><tbody>${yearTable || '<tr><td colspan="2" class="muted">Sem dados</td></tr>'}</tbody></table>
     </div>
-    <script>
-      async function postJSON(url, body){
-        const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
-        const j = await r.json().catch(()=>({}));
-        if(!r.ok){ throw new Error(j.error || 'erro'); }
-        return j;
-      }
-      async function loadJobs(){
-        const r = await fetch('/api/schedules');
-        const j = await r.json();
-        const rows = (j.jobs||[]).slice(0,300).map(x=>{
-          const dt = x.runAt ? new Date(Number(x.runAt)).toLocaleString('pt-BR') : '-';
-          const st = x.status || '-';
-          const err = x.error ? (' · erro: ' + x.error) : '';
-          return \`
-            <div style="border-top:1px solid #1f2a44;padding:10px 0">
-              <div><b>\${dt}</b> · <span class="muted">bot</span> <b>\${x.botId}</b> · <span class="muted">fone</span> <b>\${x.phone}</b></div>
-              <div class="muted">status: <b>\${st}</b>\${err}</div>
-              <div style="margin-top:6px;white-space:pre-wrap">\${(x.text||'').replace(/</g,'&lt;')}</div>
-              <div style="margin-top:8px">
-                <button class="btn btn-danger" onclick="delJob('\${x.id}')">Apagar</button>
-              </div>
-            </div>
-          \`;
-        }).join('');
-        document.getElementById('jobs').innerHTML = rows || '<div class="muted">Nenhum agendamento.</div>';
-      }
-      async function delJob(id){
-        await postJSON('/api/schedules/delete',{ id });
-        await loadJobs();
-      }
-      loadJobs();
-      setInterval(loadJobs, 15000);
-    </script>
+
+    <div class="card">
+      <div style="font-weight:800;margin-bottom:6px">Top modelos (30)</div>
+      <table style="width:100%"><thead><tr><th>Modelo</th><th>Qtd</th></tr></thead><tbody>${modelTable || '<tr><td colspan="2" class="muted">Sem dados</td></tr>'}</tbody></table>
+    </div>
   `;
-  renderPage(req,res,{ title:`Agenda (${botId})`, bodyHtml });
+  res.send(layoutMobile({ title:'Estatísticas', user:req.user, bodyHtml: body }));
 });
 
-// Users page (admin)
+
 app.get('/m/users', requireAuth, (req,res)=>{
-  if (req.user.role !== 'admin') return res.redirect('/m');
-
+  if (req.user.role !== 'admin') return res.status(403).send('forbidden');
   const users = loadUsers();
-  const rows = Object.entries(users).map(([uname, u]) => `
-    <tr>
-      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(uname)}</td>
-      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(u.role || '')}</td>
-      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(u.botId || '')}</td>
-      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(u.pass || '')}</td>
-    </tr>
-  `).join('');
-
-  const bodyHtml = `
+  const rows = Object.entries(users).map(([u,v])=>{
+    return `<tr>
+      <td><b>${htmlEscape(u)}</b></td>
+      <td>${htmlEscape(v.role||'seller')}</td>
+      <td>${htmlEscape((v.botId||'').toUpperCase())}</td>
+      <td style="display:flex;gap:6px;flex-wrap:wrap">
+        <form method="POST" action="/m/users/delete" onsubmit="return confirm('Excluir usuário?')">
+          <input type="hidden" name="username" value="${htmlEscape(u)}"/>
+          <button class="btn" type="submit" style="background:#ef4444">Excluir</button>
+        </form>
+      </td>
+    </tr>`;
+  }).join('');
+  const body = `
     <div class="card">
-      <h3>👤 Usuários</h3>
-      <div class="muted">Lista do data/users.json</div>
-      <div style="overflow:auto;margin-top:10px">
-        <table style="width:100%;border-collapse:collapse">
-          <thead>
-            <tr style="color:#94a3b8;font-size:12px;text-align:left">
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Usuário</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Role</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Bot</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Senha</th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>
+      <div style="font-weight:900">Usuários</div>
+      <div class="muted">Admin pode criar/editar vendedores. Cada vendedor vê apenas o seu bot.</div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:900;margin-bottom:8px">Criar / Atualizar</div>
+      <form method="POST" action="/m/users/upsert">
+        <label>Usuário</label><input name="username" placeholder="ex: vendedor1" required/>
+        <label>Senha</label><input name="password" placeholder="deixe vazio para manter" />
+        <label>Bot</label>
+        <select name="botId">
+          ${BOT_IDS.map(id=>`<option value="${id}">${id.toUpperCase()}</option>`).join('')}
+        </select>
+        <label>Role</label>
+        <select name="role">
+          <option value="seller">seller</option>
+          <option value="admin">admin</option>
+        </select>
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Salvar</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:900;margin-bottom:6px">Lista</div>
+      <table style="width:100%"><thead><tr><th>Usuário</th><th>Role</th><th>Bot</th><th>Ação</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="4" class="muted">Sem usuários</td></tr>'}</tbody></table>
     </div>
   `;
-  renderPage(req,res,{ title:'Usuários', bodyHtml });
+  res.send(layoutMobile({ title:'Usuários', user:req.user, bodyHtml: body }));
 });
 
-// /admin atalho
-app.get('/admin', requireAuth, (req,res)=>res.redirect('/d'));
+app.post('/m/users/upsert', requireAuth, (req,res)=>{
+  if (req.user.role !== 'admin') return res.status(403).send('forbidden');
+  const { username, password, botId, role } = req.body || {};
+  if (!username) return res.redirect('/m/users');
+  if (role && !['admin','seller'].includes(role)) return res.redirect('/m/users');
+  if (botId && !BOT_IDS.includes(botId)) return res.redirect('/m/users');
+  const users = loadUsers();
+  const cur = users[username] || {};
+  users[username] = {
+    role: role || cur.role || 'seller',
+    botId: (role==='admin') ? '*' : (botId || cur.botId || 'v1'),
+    pass: (password && String(password).trim()) ? String(password).trim() : (cur.pass || cur.pass || cur.password || '123')
+  };
+  saveUsers(users);
+  res.redirect('/m/users');
+});
 
-// Desktop
-app.get('/d', requireAuth, async (req,res)=>{
-  const { botId, bot } = pickBot(req);
-  const st = bot.getStatus?.() || {};
-  const qrUrl = await qrDataUrlFn(st.qr || null);
+app.post('/m/users/delete', requireAuth, (req,res)=>{
+  if (req.user.role !== 'admin') return res.status(403).send('forbidden');
+  const username = req.body.username;
+  const users = loadUsers();
+  delete users[username];
+  saveUsers(users);
+  res.redirect('/m/users');
+});
 
-  const bodyHtml = `
-    <div class="card">
-      <h2 style="margin:0 0 10px 0">🖥️ Desktop (${htmlEscape(botId)})</h2>
-      <div class="muted">Conexão: <b>${st.connected ? 'Conectado' : 'Desconectado'}</b> · Bot: <b>${st.enabled ? 'Ativo' : 'Pausado'}</b></div>
-      <div style="margin-top:12px">${qrUrl ? `<img src="${qrUrl}" style="width:260px;border-radius:14px;background:#fff;padding:8px"/>` : `<div class="muted">Sem QR</div>`}</div>
-      <div class="row" style="margin-top:12px">
-        <a class="btn btn-ghost" href="/m">Ir para Mobile</a>
-        <a class="btn btn-ghost" href="/logout">Sair</a>
+// ------- desktop admin (overview) -------
+app.get('/admin', requireAuth, async (req,res)=>{
+  if (req.user.role !== 'admin') return res.redirect('/m');
+  const rows = [];
+  for (const id of BOT_IDS) {
+    const st = bots[id].getStatus();
+    const qrUrl = await qrDataUrl(st.qr);
+    rows.push(`
+      <div class="card">
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <div>
+            <div style="font-size:18px;font-weight:800">${id.toUpperCase()}</div>
+            <div class="muted">Conectado: <b>${st.connected?'SIM':'NÃO'}</b> · Funil: <b>${st.enabled?'ON':'OFF'}</b> · Fila: <b>${st.queueSize}</b></div>
+          </div>
+          <div class="row">
+            <form method="POST" action="/admin/toggle-connect?botId=${id}"><button class="btn ${st.connected?'btn-danger':'btn-primary'}" type="submit">${st.connected?'Desconectar':'Conectar'}</button></form>
+            <form method="POST" action="/admin/toggle-enabled?botId=${id}"><button class="btn btn-ghost" type="submit">${st.enabled?'Pausar':'Ativar'}</button></form>
+            <a class="btn btn-ghost" style="text-decoration:none" href="/m?botId=${id}">Abrir no mobile</a>
+          </div>
+        </div>
+        ${st.connected ? '' : (qrUrl ? `<div style="margin-top:10px"><img src="${qrUrl}" style="width:220px;border-radius:12px;background:#fff"/></div>` : '')}
       </div>
-    </div>
-  `;
-  res.send(layoutDesktop({ title:`Desktop (${botId})`, bodyHtml }));
+    `);
+  }
+
+  const html = layoutDesktop({
+    title: 'Admin · MultiBot',
+    bodyHtml: `
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+          <div>
+            <div style="font-size:22px;font-weight:900">Admin · MultiBot</div>
+            <div class="muted">Gerencia os 5 números. Use volume persistente no Railway para manter sessões.</div>
+          </div>
+          <div class="row"><a class="btn btn-primary" style="text-decoration:none" href="/m">Ir para mobile</a><a class="btn btn-ghost" style="text-decoration:none" href="/logout">Sair</a></div>
+        </div>
+      </div>
+      ${rows.join('')}
+    `
+  });
+  res.send(html);
 });
 
-// start server
+app.post('/admin/toggle-connect', requireAuth, async (req,res)=>{
+  if (req.user.role !== 'admin') return res.status(403).send('forbidden');
+  const botId = req.query.botId;
+  if (!BOT_IDS.includes(botId)) return res.redirect('/admin');
+  const st = bots[botId].getStatus();
+  if (st.connected) await bots[botId].disconnect(); else await bots[botId].connect();
+  res.redirect('/admin');
+});
+
+app.post('/admin/toggle-enabled', requireAuth, (req,res)=>{
+  if (req.user.role !== 'admin') return res.status(403).send('forbidden');
+  const botId = req.query.botId;
+  if (!BOT_IDS.includes(botId)) return res.redirect('/admin');
+  const st = bots[botId].getStatus();
+  bots[botId].setEnabled(!st.enabled);
+  res.redirect('/admin');
+});
+
+// ------- start -------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', ()=>{
-  console.log(`✅ MultiBot rodando: http://localhost:${PORT}/m`);
-});
+app.listen(PORT, '0.0.0.0', ()=>console.log(`✅ MultiBot rodando: http://localhost:${PORT}/m`));
