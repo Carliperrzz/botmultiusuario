@@ -48,8 +48,10 @@ function layoutMobile({ title, user, bodyHtml, footerHtml }) {
 </head>
 <body>
   <div class="top">
-    <h1>📲 ${htmlEscape(title)} <span class="pill">${htmlEscape(user.name)} · ${htmlEscape(user.role)}</span></h1>
-    <div class="tabs">
+    const u = user || { name: 'Usuário', role: 'viewer' };
+
+<h1>📲 ${htmlEscape(title)} <span class="pill">${htmlEscape(u.name)} · ${htmlEscape(u.role)}</span></h1>
+<div class="tabs">
       <a class="tab" href="/m">Painel</a>
       <a class="tab" href="/m/messages">Mensagens</a>
       <a class="tab" href="/m/quote">Cotizar</a>
