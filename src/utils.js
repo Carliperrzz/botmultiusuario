@@ -10,8 +10,11 @@ function loadJSON(file, fallback = {}) {
     return fallback;
   }
 }
+
 function saveJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+  // ✅ FIX Railway: garante que a pasta exista antes de escrever
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
 }
 
 function htmlEscape(str) {
