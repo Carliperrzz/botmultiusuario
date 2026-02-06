@@ -14,21 +14,20 @@ const qrDataUrlFn = async (qr) => (qr ? qrDataUrl(qr) : null);
 // Base do projeto (Railway usa /app)
 const BASE_DIR = __dirname;
 
-// ✅ Em Railway, recomendo criar um Volume e montar em /app/data.
-// Se DATA_DIR não estiver setado, usa ./data local.
 const DATA_BASE = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
   : path.join(BASE_DIR, 'data');
 
-// Auth dentro do data (persistente com volume)
 const AUTH_BASE = process.env.AUTH_DIR
   ? path.resolve(process.env.AUTH_DIR)
   : path.join(DATA_BASE, 'auth');
 
 const BOT_IDS = ['v1', 'v2', 'v3', 'v4', 'v5'];
 
-// ------- event logger (global) -------
+// ------- storage -------
 const EVENTS_FILE = path.join(DATA_BASE, 'events.json');
+const USERS_FILE = path.join(DATA_BASE, 'users.json');
+const SCHEDULES_FILE = path.join(DATA_BASE, 'schedules.json');
 
 function ensureBaseStorage() {
   try {
@@ -40,11 +39,10 @@ function ensureBaseStorage() {
       fs.mkdirSync(path.join(AUTH_BASE, botId), { recursive: true });
     }
 
-    if (!fs.existsSync(EVENTS_FILE)) {
-      fs.writeFileSync(EVENTS_FILE, '[]', 'utf8');
-    }
+    if (!fs.existsSync(EVENTS_FILE)) fs.writeFileSync(EVENTS_FILE, '[]', 'utf8');
+    if (!fs.existsSync(SCHEDULES_FILE)) fs.writeFileSync(SCHEDULES_FILE, '[]', 'utf8');
   } catch (e) {
-    console.error('[BOOT] Falha ao preparar pastas de dados:', e?.message || e);
+    console.error('[BOOT] Falha ao preparar pastas:', e?.message || e);
   }
 }
 ensureBaseStorage();
@@ -60,9 +58,8 @@ function appendEvent(evt) {
   }
 }
 
-// ------- bots (lazy init) -------
+// ------- bots (lazy) -------
 const bots = {};
-
 function getBot(botId) {
   const id = BOT_IDS.includes(botId) ? botId : 'v1';
   if (!bots[id]) {
@@ -81,11 +78,10 @@ function getBot(botId) {
 }
 
 // ------- users -------
-const USERS_FILE = path.join(DATA_BASE, 'users.json');
-function loadUsers() { return loadJSON(USERS_FILE, {}); }
-function saveUsers(u) { return saveJSON(USERS_FILE, u); }
+function loadUsers(){ return loadJSON(USERS_FILE, {}); }
+function saveUsers(u){ return saveJSON(USERS_FILE, u); }
 
-(function ensureDefaultUsers() {
+(function ensureDefaultUsers(){
   try {
     if (fs.existsSync(USERS_FILE)) return;
     const seed = {
@@ -97,13 +93,13 @@ function saveUsers(u) { return saveJSON(USERS_FILE, u); }
       v5: { role: 'seller', botId: 'v5', pass: '123' },
     };
     saveJSON(USERS_FILE, seed);
-    console.log('[BOOT] users.json criado com usuários padrão.');
+    console.log('[BOOT] users.json criado (seed).');
   } catch (e) {
-    console.error('[BOOT] Falha ao criar users.json:', e?.message || e);
+    console.error('[BOOT] seed users fail:', e?.message || e);
   }
 })();
 
-function getUser(req) {
+function getUser(req){
   const users = loadUsers();
   const u = req.session?.user;
   if (!u) return null;
@@ -112,20 +108,19 @@ function getUser(req) {
   return { username: u.username, ...fresh };
 }
 
-function requireAuth(req, res, next) {
+function requireAuth(req,res,next){
   const u = getUser(req);
   if (!u) return res.redirect('/login');
   req.user = u;
   next();
 }
 
-function allowedBotIds(user) {
+function allowedBotIds(user){
   if (user.role === 'admin') return BOT_IDS;
   return [user.botId];
 }
 
-function getSelectedBotId(reqLike) {
-  // reqLike: { user, query }
+function getSelectedBotId(reqLike){
   if (!reqLike?.user) return 'v1';
   if (reqLike.user.role !== 'admin') return reqLike.user.botId;
   const q = reqLike.query?.botId;
@@ -133,40 +128,121 @@ function getSelectedBotId(reqLike) {
   return 'v1';
 }
 
-// -------- helpers ----------
-function safeJSONParse(maybeStr, fallback) {
-  try {
-    if (typeof maybeStr === 'string') return JSON.parse(maybeStr);
-    if (typeof maybeStr === 'object' && maybeStr) return maybeStr;
-    return fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function renderPage(req, res, { title, bodyHtml, footerHtml }) {
-  // layoutMobile já tem menu completo; nós só colocamos o miolo (bodyHtml)
-  res.send(layoutMobile({
-    title,
-    user: { name: req.user.username, role: req.user.role, username: req.user.username },
-    username: req.user.username,
-    role: req.user.role,
-    bodyHtml,
-    footerHtml
-  }));
-}
-
-function pickBot(req) {
+function pickBot(req){
   const botId = getSelectedBotId({ user: req.user, query: { botId: req.query.botId } });
   const allowed = allowedBotIds(req.user);
   return { botId, allowed, bot: getBot(botId) };
 }
 
+// ------- scheduler (persistente) -------
+function loadSchedules() { return loadJSON(SCHEDULES_FILE, []); }
+function saveSchedules(arr) { return saveJSON(SCHEDULES_FILE, arr); }
+
+function newId() {
+  return Math.random().toString(36).slice(2, 8) + '-' + Date.now().toString(36);
+}
+
+function brPhoneToJid(phone) {
+  // acepta: 5511999999999 / 11 99999-9999 / +55...
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (!digits) return null;
+  // Si no tiene 55, asumimos Brasil
+  const full = digits.startsWith('55') ? digits : ('55' + digits);
+  return full + '@s.whatsapp.net';
+}
+
+// 🔥 Intento de envío: auto-detect de métodos del botCore
+async function sendTextWithBot(bot, toJid, text) {
+  if (!bot || !toJid || !text) throw new Error('missing params');
+
+  // posibles nombres (depende tu botCore)
+  const candidates = [
+    'sendText',
+    'sendMessage',
+    'send',
+    'enqueueMessage',
+    'queueMessage',
+    'sendOut',
+  ];
+
+  for (const fn of candidates) {
+    if (typeof bot[fn] === 'function') {
+      // casos más comunes:
+      // - sendText(jid, text)
+      // - sendMessage(jid, {text})
+      // - enqueueMessage({to, text})
+      try {
+        if (fn === 'sendMessage') return await bot[fn](toJid, { text });
+        if (fn === 'enqueueMessage' || fn === 'queueMessage') return await bot[fn]({ to: toJid, text });
+        return await bot[fn](toJid, text);
+      } catch (e) {
+        // probamos siguiente
+      }
+    }
+  }
+
+  // último intento: si bot tiene sock (Baileys)
+  if (bot.sock && typeof bot.sock.sendMessage === 'function') {
+    return await bot.sock.sendMessage(toJid, { text });
+  }
+
+  throw new Error('BotCore sem método de envio detectado (sendText/sendMessage/enqueueMessage)');
+}
+
+// corre cada 10s
+async function schedulerTick() {
+  const now = Date.now();
+  const arr = loadSchedules();
+  let changed = false;
+
+  for (const job of arr) {
+    if (job.status !== 'pending') continue;
+    if (!job.runAt) continue;
+    if (Number(job.runAt) > now) continue;
+
+    // ejecutar
+    job.status = 'running';
+    job.startedAt = new Date().toISOString();
+    changed = true;
+    saveSchedules(arr);
+
+    try {
+      const bot = getBot(job.botId || 'v1');
+      const st = bot.getStatus?.() || {};
+      if (!st.connected) throw new Error('bot desconectado');
+      if (!st.enabled) throw new Error('bot pausado');
+
+      const jid = brPhoneToJid(job.phone);
+      if (!jid) throw new Error('telefone inválido');
+
+      await sendTextWithBot(bot, jid, job.text);
+
+      job.status = 'done';
+      job.doneAt = new Date().toISOString();
+      appendEvent({ botId: job.botId, action: 'scheduled_sent', phone: job.phone, jobId: job.id });
+    } catch (e) {
+      job.status = 'error';
+      job.error = String(e?.message || e);
+      job.failedAt = new Date().toISOString();
+      appendEvent({ botId: job.botId, action: 'scheduled_error', phone: job.phone, jobId: job.id, error: job.error });
+    } finally {
+      changed = true;
+      saveSchedules(arr);
+    }
+  }
+
+  if (changed) saveSchedules(arr);
+}
+
+setInterval(() => {
+  schedulerTick().catch((e) => console.error('[schedulerTick]', e?.message || e));
+}, 10000);
+
 // ---------- app ----------
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname,'public')));
 
 app.use(session({
   secret: process.env.SESSION_SECRET || 'change-me',
@@ -175,12 +251,12 @@ app.use(session({
   cookie: { maxAge: 14 * 24 * 60 * 60 * 1000 }
 }));
 
-app.get('/health', (req, res) => res.status(200).send('ok'));
-app.get('/', (req, res) => res.redirect('/m'));
-app.get('/app', requireAuth, (req, res) => res.sendFile(path.join(__dirname, 'public', 'app', 'index.html')));
+app.get('/health', (req,res)=>res.status(200).send('ok'));
+app.get('/', (req,res)=>res.redirect('/m'));
+app.get('/app', requireAuth, (req,res)=>res.sendFile(path.join(__dirname,'public','app','index.html')));
 
 // ------- auth -------
-app.get('/login', (req, res) => {
+app.get('/login', (req,res)=>{
   const html = `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Login</title>
   <style>
@@ -199,13 +275,13 @@ app.get('/login', (req, res) => {
       <label>Usuário</label><input name="username" placeholder="admin / v1 / v2 ..." required/>
       <label>Senha</label><input name="password" type="password" required/>
       <button type="submit">Entrar</button>
-      <div class="muted">Dica: admin/admin123 · v1/123 ... (mude em data/users.json)</div>
+      <div class="muted">Dica: admin/admin123 · v1/123 ...</div>
     </form>
   </div></div></body></html>`;
   res.send(html);
 });
 
-app.post('/login', (req, res) => {
+app.post('/login', (req,res)=>{
   const username = (req.body.username || '').trim();
   const password = (req.body.password || '').trim();
   const users = loadUsers();
@@ -215,21 +291,12 @@ app.post('/login', (req, res) => {
   res.redirect('/m');
 });
 
-app.get('/logout', (req, res) => {
-  req.session.destroy(() => res.redirect('/login'));
+app.get('/logout', (req,res)=>{
+  req.session.destroy(()=>res.redirect('/login'));
 });
 
-// ------- API -------
-app.get('/api/me', requireAuth, (req, res) => {
-  res.json({
-    username: req.user.username,
-    role: req.user.role,
-    defaultBotId: (req.user.role === 'admin' ? 'v1' : req.user.botId),
-    allowedBotIds: allowedBotIds(req.user)
-  });
-});
-
-app.get('/api/status', requireAuth, async (req, res) => {
+// ------- API base -------
+app.get('/api/status', requireAuth, async (req,res)=>{
   const botId = getSelectedBotId({ user: req.user, query: { botId: req.query.botId } });
   const st = getBot(botId).getStatus?.() || {};
   const qr = st.qr || null;
@@ -237,7 +304,7 @@ app.get('/api/status', requireAuth, async (req, res) => {
   res.json({ botId, connected: !!st.connected, enabled: !!st.enabled, queueSize: st.queueSize ?? 0, qrDataUrl: qrData });
 });
 
-app.post('/api/toggle-connect', requireAuth, async (req, res) => {
+app.post('/api/toggle-connect', requireAuth, async (req,res)=>{
   const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
   const b = getBot(botId);
   const st = b.getStatus?.() || {};
@@ -247,99 +314,98 @@ app.post('/api/toggle-connect', requireAuth, async (req, res) => {
   } catch (e) {
     console.error('[toggle-connect]', e?.message || e);
   }
-  res.json({ ok: true });
+  res.json({ ok:true });
 });
 
-app.post('/api/toggle-enabled', requireAuth, (req, res) => {
+app.post('/api/toggle-enabled', requireAuth, (req,res)=>{
   const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
   const b = getBot(botId);
   const st = b.getStatus?.() || {};
-  try {
-    b.setEnabled?.(!st.enabled);
-  } catch (e) {
-    console.error('[toggle-enabled]', e?.message || e);
-  }
-  res.json({ ok: true });
+  try { b.setEnabled?.(!st.enabled); } catch(e) {}
+  res.json({ ok:true });
 });
 
-app.get('/api/stats', requireAuth, (req, res) => {
-  const botId = getSelectedBotId({ user: req.user, query: { botId: req.query.botId } });
-  const b = getBot(botId);
-
-  const rules = b.getConfig?.()?.rules || { minYearFollowUp: 2022 };
-  const minYear = Number(rules.minYearFollowUp || 2022);
-
-  const events = loadJSON(EVENTS_FILE, []);
-  const totalSent = events.filter(e => e.botId === botId && e.action === 'auto_sent').length;
-
-  const leads = b.getLeads?.() || {};
-  let below = 0, atOrAbove = 0;
-  for (const lead of Object.values(leads || {})) {
-    const y = Number(lead.year || 0);
-    if (!y) continue;
-    if (y < minYear) below += 1;
-    else atOrAbove += 1;
-  }
-
-  res.json({
-    botId,
-    minYearFollowUp: minYear,
-    totalMessagesSent: totalSent,
-    carsBelowMinYear: below,
-    carsAtOrAboveMinYear: atOrAbove
-  });
+// ------- SCHEDULER API -------
+app.get('/api/schedules', requireAuth, (req,res)=>{
+  const arr = loadSchedules();
+  // admin ve todo; seller ve su bot
+  const allowed = allowedBotIds(req.user);
+  const out = (req.user.role === 'admin')
+    ? arr
+    : arr.filter(j => allowed.includes(j.botId));
+  res.json({ jobs: out.sort((a,b)=>Number(b.runAt||0)-Number(a.runAt||0)) });
 });
 
-// Users admin CRUD (admin only)
-app.get('/api/users', requireAuth, (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
-  res.json({ users: loadUsers() });
-});
+app.post('/api/schedules/add', requireAuth, (req,res)=>{
+  const { botId, phone, text, runAt } = req.body || {};
+  const selected = getSelectedBotId({ user: req.user, query: { botId } });
+  const allowed = allowedBotIds(req.user);
+  if (req.user.role !== 'admin' && !allowed.includes(selected)) return res.status(403).json({ error:'forbidden' });
 
-app.post('/api/users/upsert', requireAuth, (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
-  const { username, password, botId, role } = req.body || {};
-  if (!username) return res.status(400).json({ error: 'missing username' });
-  if (role && !['admin', 'seller'].includes(role)) return res.status(400).json({ error: 'bad role' });
-  if (botId && !BOT_IDS.includes(botId)) return res.status(400).json({ error: 'bad botId' });
+  const ts = Number(runAt);
+  if (!ts || !phone || !text) return res.status(400).json({ error:'missing fields' });
 
-  const users = loadUsers();
-  const cur = users[username] || {};
-  users[username] = {
-    role: role || cur.role || 'seller',
-    botId: (role === 'admin') ? '*' : (botId || cur.botId || 'v1'),
-    pass: (password && String(password).trim()) ? String(password).trim() : (cur.pass || cur.password || '123')
+  const arr = loadSchedules();
+  const job = {
+    id: newId(),
+    type: 'send_text',
+    botId: selected,
+    phone: String(phone),
+    text: String(text),
+    runAt: ts,
+    status: 'pending',
+    createdAt: new Date().toISOString(),
+    createdBy: req.user.username
   };
-  saveUsers(users);
-  res.json({ ok: true });
+  arr.push(job);
+  saveSchedules(arr);
+  appendEvent({ botId: selected, action: 'scheduled_created', phone: job.phone, jobId: job.id });
+  res.json({ ok:true, job });
 });
 
-app.post('/api/users/delete', requireAuth, (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
-  const { username } = req.body || {};
-  if (!username) return res.status(400).json({ error: 'missing username' });
-  const users = loadUsers();
-  delete users[username];
-  saveUsers(users);
-  res.json({ ok: true });
+app.post('/api/schedules/delete', requireAuth, (req,res)=>{
+  const { id } = req.body || {};
+  if (!id) return res.status(400).json({ error:'missing id' });
+
+  const arr = loadSchedules();
+  const job = arr.find(j => j.id === id);
+  if (!job) return res.json({ ok:true });
+
+  const allowed = allowedBotIds(req.user);
+  if (req.user.role !== 'admin' && !allowed.includes(job.botId)) return res.status(403).json({ error:'forbidden' });
+
+  const next = arr.filter(j => j.id !== id);
+  saveSchedules(next);
+  appendEvent({ botId: job.botId, action: 'scheduled_deleted', phone: job.phone, jobId: job.id });
+  res.json({ ok:true });
 });
 
-// ------- PAGES (todas as abas do menu) -------
+// ------- PAGES -------
+function renderPage(req,res,{ title, bodyHtml, footerHtml }){
+  res.send(layoutMobile({
+    title,
+    user: { name: req.user.username, role: req.user.role, username: req.user.username },
+    username: req.user.username,
+    role: req.user.role,
+    bodyHtml,
+    footerHtml
+  }));
+}
 
-// Home
-app.get('/m', requireAuth, async (req, res) => {
+// Home /m
+app.get('/m', requireAuth, async (req,res)=>{
   const { botId, allowed, bot } = pickBot(req);
   const st = bot.getStatus?.() || {};
   const qr = st.qr || null;
   const qrUrl = await qrDataUrlFn(qr);
 
   const options = allowed.map(id =>
-    `<option value="${id}" ${id === botId ? 'selected' : ''}>${id}</option>`
+    `<option value="${id}" ${id===botId?'selected':''}>${id}</option>`
   ).join('');
 
   const bodyHtml = `
     <div class="card">
-      <div class="row" style="align-items:center;justify-content:space-between">
+      <div class="row" style="justify-content:space-between;align-items:center">
         <div class="row" style="align-items:center">
           <div class="muted">Bot</div>
           <select onchange="location.href='/m?botId='+this.value">${options}</select>
@@ -362,59 +428,218 @@ app.get('/m', requireAuth, async (req, res) => {
           ${qrUrl ? `<img src="${qrUrl}" alt="QR"/>` : `<div class="muted">Sem QR agora.</div>`}
         </div>
       </div>
-
-      <div class="card" style="margin-top:12px">
-        <div class="muted">Estatísticas (rápido)</div>
-        <div id="statsBox" class="muted" style="margin-top:8px">Carregando…</div>
-      </div>
     </div>
 
     <script>
       async function postJSON(url, body){
         await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
       }
-      async function toggleConnect(botId){
-        await postJSON('/api/toggle-connect',{botId});
-        location.reload();
-      }
-      async function toggleEnabled(botId){
-        await postJSON('/api/toggle-enabled',{botId});
-        location.reload();
-      }
-      (async ()=>{
-        const r = await fetch('/api/stats?botId=${encodeURIComponent(botId)}');
-        const j = await r.json();
-        document.getElementById('statsBox').innerHTML =
-          'Mensagens auto: <b>'+ (j.totalMessagesSent ?? 0) +'</b><br>'+
-          'Ano mín: <b>'+ (j.minYearFollowUp ?? '-') +'</b><br>'+
-          'Abaixo: <b>'+ (j.carsBelowMinYear ?? 0) +'</b> · OK: <b>'+ (j.carsAtOrAboveMinYear ?? 0) +'</b>';
-      })();
+      async function toggleConnect(botId){ await postJSON('/api/toggle-connect',{botId}); location.reload(); }
+      async function toggleEnabled(botId){ await postJSON('/api/toggle-enabled',{botId}); location.reload(); }
     </script>
   `;
-
-  renderPage(req, res, { title: `Painel (${botId})`, bodyHtml });
+  renderPage(req,res,{ title:`Painel (${botId})`, bodyHtml });
 });
 
-// Messages / Rules (edição JSON)
-app.get('/m/messages', requireAuth, (req, res) => {
+// ✅ Programar mensagem (UI REAL)
+app.get('/m/program', requireAuth, (req,res)=>{
+  const { botId, allowed } = pickBot(req);
+  const botOptions = allowed.map(id => `<option value="${id}" ${id===botId?'selected':''}>${id}</option>`).join('');
+
+  const bodyHtml = `
+  <div class="card">
+    <h3>⏱️ Programar Mensagem</h3>
+    <div class="muted">Agenda um envio automático (fica salvo no data/schedules.json).</div>
+
+    <label>Bot</label>
+    <select id="botIdSel">${botOptions}</select>
+
+    <label>Telefone (com DDD)</label>
+    <input id="phone" placeholder="11 99999-9999" />
+
+    <label>Data e hora (Brasil)</label>
+    <input id="when" type="datetime-local"/>
+
+    <label>Mensagem</label>
+    <textarea id="text" placeholder="Oi! ..."></textarea>
+
+    <div class="row" style="margin-top:10px">
+      <button class="btn btn-primary" onclick="addJob()">Agendar</button>
+      <button class="btn btn-ghost" onclick="loadJobs()">Atualizar lista</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>📋 Programados</h3>
+    <div id="jobs" class="muted">Carregando…</div>
+  </div>
+
+  <script>
+    function toTs(dtLocal){
+      // dtLocal "YYYY-MM-DDTHH:MM"
+      if(!dtLocal) return null;
+      const d = new Date(dtLocal);
+      const ts = d.getTime();
+      return Number.isFinite(ts) ? ts : null;
+    }
+
+    async function postJSON(url, body){
+      const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+      return r.json().catch(()=>({}));
+    }
+
+    async function loadJobs(){
+      const r = await fetch('/api/schedules');
+      const j = await r.json();
+      const rows = (j.jobs||[]).slice(0,200).map(x=>{
+        const dt = x.runAt ? new Date(Number(x.runAt)).toLocaleString('pt-BR') : '-';
+        const st = x.status || '-';
+        const err = x.error ? (' · erro: ' + x.error) : '';
+        return \`
+          <div style="border-top:1px solid #1f2a44;padding:10px 0">
+            <div><b>\${dt}</b> · <span class="muted">bot</span> <b>\${x.botId}</b> · <span class="muted">fone</span> <b>\${x.phone}</b></div>
+            <div class="muted">status: <b>\${st}</b>\${err}</div>
+            <div style="margin-top:6px;white-space:pre-wrap">\${(x.text||'').replace(/</g,'&lt;')}</div>
+            <div style="margin-top:8px">
+              <button class="btn btn-danger" onclick="delJob('\${x.id}')">Apagar</button>
+            </div>
+          </div>
+        \`;
+      }).join('');
+      document.getElementById('jobs').innerHTML = rows || '<div class="muted">Nenhum agendamento.</div>';
+    }
+
+    async function addJob(){
+      const botId = document.getElementById('botIdSel').value;
+      const phone = document.getElementById('phone').value;
+      const text = document.getElementById('text').value;
+      const when = document.getElementById('when').value;
+      const runAt = toTs(when);
+      const out = await postJSON('/api/schedules/add',{ botId, phone, text, runAt });
+      if(out && out.error) alert(out.error);
+      document.getElementById('text').value = '';
+      await loadJobs();
+    }
+
+    async function delJob(id){
+      await postJSON('/api/schedules/delete',{ id });
+      await loadJobs();
+    }
+
+    loadJobs();
+  </script>
+  `;
+
+  renderPage(req,res,{ title:`Programar (${botId})`, bodyHtml });
+});
+
+// ✅ Agenda = vista del scheduler (misma lista, otra pestaña)
+app.get('/m/agenda', requireAuth, (req,res)=>{
+  const { botId } = pickBot(req);
+  const bodyHtml = `
+    <div class="card">
+      <h3>🗓️ Agenda</h3>
+      <div class="muted">Aqui você vê tudo que está pendente / executando / concluído.</div>
+      <div style="margin-top:10px">
+        <a class="btn btn-primary" href="/m/program">Ir para Programar Mensagem</a>
+      </div>
+    </div>
+    <div class="card">
+      <h3>📋 Lista</h3>
+      <div id="jobs" class="muted">Carregando…</div>
+    </div>
+    <script>
+      async function postJSON(url, body){
+        const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+        return r.json().catch(()=>({}));
+      }
+      async function loadJobs(){
+        const r = await fetch('/api/schedules');
+        const j = await r.json();
+        const rows = (j.jobs||[]).slice(0,300).map(x=>{
+          const dt = x.runAt ? new Date(Number(x.runAt)).toLocaleString('pt-BR') : '-';
+          const st = x.status || '-';
+          const err = x.error ? (' · erro: ' + x.error) : '';
+          return \`
+            <div style="border-top:1px solid #1f2a44;padding:10px 0">
+              <div><b>\${dt}</b> · <span class="muted">bot</span> <b>\${x.botId}</b> · <span class="muted">fone</span> <b>\${x.phone}</b></div>
+              <div class="muted">status: <b>\${st}</b>\${err}</div>
+              <div style="margin-top:6px;white-space:pre-wrap">\${(x.text||'').replace(/</g,'&lt;')}</div>
+              <div style="margin-top:8px">
+                <button class="btn btn-danger" onclick="delJob('\${x.id}')">Apagar</button>
+              </div>
+            </div>
+          \`;
+        }).join('');
+        document.getElementById('jobs').innerHTML = rows || '<div class="muted">Nenhum agendamento.</div>';
+      }
+      async function delJob(id){
+        await postJSON('/api/schedules/delete',{ id });
+        await loadJobs();
+      }
+      loadJobs();
+      setInterval(loadJobs, 15000);
+    </script>
+  `;
+  renderPage(req,res,{ title:`Agenda (${botId})`, bodyHtml });
+});
+
+// Mantengo otras páginas como estaban (para que no rompa)
+app.get('/m/messages', requireAuth, (req,res)=>{
   const { botId, bot } = pickBot(req);
   const cfg = bot.getConfig?.() || {};
   const bodyHtml = `
     <div class="card">
       <h3>📝 Mensagens (${htmlEscape(botId)})</h3>
+      <div class="muted">Aqui continua a edição JSON (seu botCore usa isso).</div>
       <form method="POST" action="/save">
         <input type="hidden" name="botId" value="${htmlEscape(botId)}"/>
         <label>Messages (JSON)</label>
         <textarea name="messages">${htmlEscape(JSON.stringify(cfg.messages || {}, null, 2))}</textarea>
         <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Salvar</button>
       </form>
-      <div class="muted" style="margin-top:10px">Se ficar inválido, o bot usa o último válido.</div>
     </div>
   `;
-  renderPage(req, res, { title: `Mensagens (${botId})`, bodyHtml });
+  renderPage(req,res,{ title:`Mensagens (${botId})`, bodyHtml });
 });
 
-app.get('/m/rules', requireAuth, (req, res) => {
+app.get('/m/leads', requireAuth, (req,res)=>{
+  const { botId, bot } = pickBot(req);
+  const leads = bot.getLeads?.() || {};
+  const rows = Object.entries(leads).slice(0,300).map(([id,l])=>{
+    const name = l.name || l.nome || '';
+    const phone = l.phone || l.telefone || id;
+    const year = l.year || l.ano || '';
+    const stage = l.stage || l.funil || l.status || '';
+    return `<tr>
+      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(phone)}</td>
+      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(name)}</td>
+      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(year)}</td>
+      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(stage)}</td>
+    </tr>`;
+  }).join('');
+  const bodyHtml = `
+    <div class="card">
+      <h3>👥 Leads (${htmlEscape(botId)})</h3>
+      <div style="overflow:auto;margin-top:10px">
+        <table style="width:100%;border-collapse:collapse">
+          <thead>
+            <tr style="color:#94a3b8;font-size:12px;text-align:left">
+              <th style="border-bottom:1px solid #1f2a44;padding:8px">Telefone</th>
+              <th style="border-bottom:1px solid #1f2a44;padding:8px">Nome</th>
+              <th style="border-bottom:1px solid #1f2a44;padding:8px">Ano</th>
+              <th style="border-bottom:1px solid #1f2a44;padding:8px">Etapa</th>
+            </tr>
+          </thead>
+          <tbody>${rows || `<tr><td colspan="4" class="muted" style="padding:10px">Sem leads (ou getLeads não existe).</td></tr>`}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+  renderPage(req,res,{ title:`Leads (${botId})`, bodyHtml });
+});
+
+app.get('/m/rules', requireAuth, (req,res)=>{
   const { botId, bot } = pickBot(req);
   const cfg = bot.getConfig?.() || {};
   const bodyHtml = `
@@ -428,202 +653,18 @@ app.get('/m/rules', requireAuth, (req, res) => {
       </form>
     </div>
   `;
-  renderPage(req, res, { title: `Regras (${botId})`, bodyHtml });
+  renderPage(req,res,{ title:`Regras (${botId})`, bodyHtml });
 });
 
-// Stats page (com endpoint)
-app.get('/m/stats', requireAuth, (req, res) => {
-  const { botId } = pickBot(req);
-  const bodyHtml = `
-    <div class="card">
-      <h3>📊 Estatísticas (${htmlEscape(botId)})</h3>
-      <div id="statsFull" class="muted">Carregando…</div>
-    </div>
-    <script>
-      (async ()=>{
-        const r = await fetch('/api/stats?botId=${encodeURIComponent(botId)}');
-        const j = await r.json();
-        document.getElementById('statsFull').innerHTML =
-          '<b>Mensagens auto:</b> ' + (j.totalMessagesSent ?? 0) + '<br>' +
-          '<b>Ano mín follow-up:</b> ' + (j.minYearFollowUp ?? '-') + '<br>' +
-          '<b>Carros abaixo:</b> ' + (j.carsBelowMinYear ?? 0) + '<br>' +
-          '<b>Carros OK:</b> ' + (j.carsAtOrAboveMinYear ?? 0);
-      })();
-    </script>
-  `;
-  renderPage(req, res, { title: `Estatísticas (${botId})`, bodyHtml });
-});
+function safeJSONParse(maybeStr, fallback){
+  try{
+    if (typeof maybeStr === 'string') return JSON.parse(maybeStr);
+    if (typeof maybeStr === 'object' && maybeStr) return maybeStr;
+    return fallback;
+  }catch{ return fallback; }
+}
 
-// Leads (lista simples, não quebra se bot não tiver)
-app.get('/m/leads', requireAuth, (req, res) => {
-  const { botId, bot } = pickBot(req);
-  const leads = bot.getLeads?.() || {};
-  const rows = Object.entries(leads).slice(0, 300).map(([id, l]) => {
-    const name = l.name || l.nome || '';
-    const phone = l.phone || l.telefone || id;
-    const year = l.year || l.ano || '';
-    const score = l.score ?? l.leadScore ?? '';
-    const stage = l.stage || l.funil || l.status || '';
-    return `<tr>
-      <td>${htmlEscape(phone)}</td>
-      <td>${htmlEscape(name)}</td>
-      <td>${htmlEscape(year)}</td>
-      <td>${htmlEscape(stage)}</td>
-      <td>${htmlEscape(score)}</td>
-    </tr>`;
-  }).join('');
-
-  const bodyHtml = `
-    <div class="card">
-      <h3>👥 Leads (${htmlEscape(botId)})</h3>
-      <div class="muted">Mostrando até 300 (para não travar).</div>
-      <div style="overflow:auto;margin-top:10px">
-        <table style="width:100%;border-collapse:collapse">
-          <thead>
-            <tr style="color:#94a3b8;font-size:12px;text-align:left">
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Telefone</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Nome</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Ano</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Etapa</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Score</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${rows || `<tr><td colspan="5" class="muted" style="padding:10px">Sem leads ou função getLeads não disponível.</td></tr>`}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  `;
-  renderPage(req, res, { title: `Leads (${botId})`, bodyHtml });
-});
-
-// Agenda / Program / Commands / Dashboard / Quote (placeholders seguros)
-app.get('/m/agenda', requireAuth, (req, res) => {
-  const { botId, bot } = pickBot(req);
-  const agenda = bot.getAgenda?.() || bot.getSchedule?.() || null;
-  const bodyHtml = `
-    <div class="card">
-      <h3>🗓️ Agenda (${htmlEscape(botId)})</h3>
-      <div class="muted">Se sua botCore tiver getAgenda/getSchedule, aparece aqui.</div>
-      <pre style="white-space:pre-wrap;word-break:break-word;background:#0b1220;border:1px solid #1f2a44;border-radius:12px;padding:10px">${htmlEscape(JSON.stringify(agenda || {}, null, 2))}</pre>
-    </div>
-  `;
-  renderPage(req, res, { title: `Agenda (${botId})`, bodyHtml });
-});
-
-app.get('/m/program', requireAuth, (req, res) => {
-  const { botId } = pickBot(req);
-  const bodyHtml = `
-    <div class="card">
-      <h3>⏱️ Programar (${htmlEscape(botId)})</h3>
-      <div class="muted">Aqui você pode colocar a UI de programação (se já tinha antes, a gente reintroduz).</div>
-      <div class="muted">Me diga qual era a função exata aqui (ex: agendar follow-up, mudar status, etc.) e eu recrio igual.</div>
-    </div>
-  `;
-  renderPage(req, res, { title: `Programar (${botId})`, bodyHtml });
-});
-
-app.get('/m/commands', requireAuth, (req, res) => {
-  const { botId } = pickBot(req);
-  const bodyHtml = `
-    <div class="card">
-      <h3>⌨️ Comandos (${htmlEscape(botId)})</h3>
-      <div class="muted">Exemplos (ajuste conforme sua botCore):</div>
-      <pre style="white-space:pre-wrap;background:#0b1220;border:1px solid #1f2a44;border-radius:12px;padding:10px">
-#okok  -> marcar como ok
-#stop  -> parar automação
-#follow -> voltar para funil
-      </pre>
-    </div>
-  `;
-  renderPage(req, res, { title: `Comandos (${botId})`, bodyHtml });
-});
-
-app.get('/m/dashboard', requireAuth, (req, res) => {
-  const { botId } = pickBot(req);
-  const bodyHtml = `
-    <div class="card">
-      <h3>📈 Dashboard (${htmlEscape(botId)})</h3>
-      <div class="muted">Se você já tinha gráficos aqui, eu consigo recolocar – mas preciso do seu server antigo ou print.</div>
-      <div class="muted">Por enquanto, use “Estatísticas”.</div>
-    </div>
-  `;
-  renderPage(req, res, { title: `Dashboard (${botId})`, bodyHtml });
-});
-
-app.get('/m/quote', requireAuth, (req, res) => {
-  const { botId } = pickBot(req);
-  const bodyHtml = `
-    <div class="card">
-      <h3>💰 Cotizar (${htmlEscape(botId)})</h3>
-      <div class="muted">Se você tinha gerador de cotação aqui, manda um print/descrição e eu recrio idêntico.</div>
-    </div>
-  `;
-  renderPage(req, res, { title: `Cotizar (${botId})`, bodyHtml });
-});
-
-// Users (admin)
-app.get('/m/users', requireAuth, (req, res) => {
-  if (req.user.role !== 'admin') return res.redirect('/m');
-
-  const users = loadUsers();
-  const rows = Object.entries(users).map(([uname, u]) => `
-    <tr>
-      <td>${htmlEscape(uname)}</td>
-      <td>${htmlEscape(u.role || '')}</td>
-      <td>${htmlEscape(u.botId || '')}</td>
-    </tr>
-  `).join('');
-
-  const bodyHtml = `
-    <div class="card">
-      <h3>👤 Usuários</h3>
-      <div class="muted">CRUD completo continua via /api/users (se você quiser eu monto a tela aqui também).</div>
-      <div style="overflow:auto;margin-top:10px">
-        <table style="width:100%;border-collapse:collapse">
-          <thead>
-            <tr style="color:#94a3b8;font-size:12px;text-align:left">
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Usuário</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Role</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Bot</th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>
-    </div>
-  `;
-  renderPage(req, res, { title: 'Usuários', bodyHtml });
-});
-
-// Desktop alias
-app.get('/admin', requireAuth, (req, res) => res.redirect('/d'));
-
-// Desktop (mantém)
-app.get('/d', requireAuth, async (req, res) => {
-  const { botId, allowed, bot } = pickBot(req);
-  const st = bot.getStatus?.() || {};
-  const qr = st.qr || null;
-  const qrUrl = await qrDataUrlFn(qr);
-
-  const bodyHtml = `
-    <div class="card">
-      <h2 style="margin:0 0 10px 0">🖥️ Desktop (${htmlEscape(botId)})</h2>
-      <div class="muted">Conexão: <b>${st.connected ? 'Conectado' : 'Desconectado'}</b> · Bot: <b>${st.enabled ? 'Ativo' : 'Pausado'}</b> · Fila: <b>${st.queueSize ?? 0}</b></div>
-      <div style="margin-top:12px">${qrUrl ? `<img src="${qrUrl}" style="width:260px;border-radius:14px;background:#fff;padding:8px"/>` : `<div class="muted">Sem QR</div>`}</div>
-      <div class="row" style="margin-top:12px">
-        <a class="btn btn-ghost" href="/m">Ir para Mobile</a>
-        <a class="btn btn-ghost" href="/logout">Sair</a>
-      </div>
-    </div>
-  `;
-  res.send(layoutDesktop({ title: `Desktop (${botId})`, bodyHtml }));
-});
-
-// ------- save config (rules/messages) -------
-// ✅ AGORA aceita textarea string (JSON) sem quebrar
-app.post('/save', requireAuth, (req, res) => {
+app.post('/save', requireAuth, (req,res)=>{
   const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
   const b = getBot(botId);
 
@@ -634,17 +675,34 @@ app.post('/save', requireAuth, (req, res) => {
   const rulesNew = safeJSONParse(req.body.rules, rulesOld);
   const messagesNew = safeJSONParse(req.body.messages, messagesOld);
 
-  try {
-    b.setConfig?.({ rules: rulesNew, messages: messagesNew });
-  } catch (e) {
-    console.error('[save]', e?.message || e);
-  }
+  try { b.setConfig?.({ rules: rulesNew, messages: messagesNew }); } catch(e) {}
 
   res.redirect(req.headers.referer || '/m');
 });
 
+// Desktop
+app.get('/d', requireAuth, async (req,res)=>{
+  const { botId, bot } = pickBot(req);
+  const st = bot.getStatus?.() || {};
+  const qr = st.qr || null;
+  const qrUrl = await qrDataUrlFn(qr);
+
+  const bodyHtml = `
+    <div class="card">
+      <h2 style="margin:0 0 10px 0">🖥️ Desktop (${htmlEscape(botId)})</h2>
+      <div class="muted">Conexão: <b>${st.connected ? 'Conectado' : 'Desconectado'}</b> · Bot: <b>${st.enabled ? 'Ativo' : 'Pausado'}</b></div>
+      <div style="margin-top:12px">${qrUrl ? `<img src="${qrUrl}" style="width:260px;border-radius:14px;background:#fff;padding:8px"/>` : `<div class="muted">Sem QR</div>`}</div>
+      <div class="row" style="margin-top:12px">
+        <a class="btn btn-ghost" href="/m">Ir para Mobile</a>
+        <a class="btn btn-ghost" href="/logout">Sair</a>
+      </div>
+    </div>
+  `;
+  res.send(layoutDesktop({ title:`Desktop (${botId})`, bodyHtml }));
+});
+
 // start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, '0.0.0.0', ()=>{
   console.log(`✅ MultiBot rodando: http://localhost:${PORT}/m`);
 });
