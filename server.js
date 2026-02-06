@@ -298,8 +298,11 @@ app.get('/m', requireAuth, async (req,res)=>{
   const qrUrl = await qrDataUrlFn(qr);
 
   const html = layoutMobile({
+    // ✅ PASAMOS user COMPLETO (para evitar crash en templates)
+    user: { username: req.user.username, role: req.user.role, name: req.user.username },
     username: req.user.username,
     role: req.user.role,
+
     botId,
     allowedBotIds: allowed,
     status: st,
@@ -320,8 +323,11 @@ app.get('/d', requireAuth, async (req,res)=>{
   const qrUrl = await qrDataUrlFn(qr);
 
   const html = layoutDesktop({
+    // ✅ PASAMOS user COMPLETO (para evitar crash en templates)
+    user: { username: req.user.username, role: req.user.role, name: req.user.username },
     username: req.user.username,
     role: req.user.role,
+
     botId,
     allowedBotIds: allowed,
     status: st,
@@ -343,7 +349,6 @@ app.post('/save', requireAuth, (req,res)=>{
   const messages = cfg.messages || {};
 
   // merge rules/messages from form
-  // (mantém sua lógica original — botCore provavelmente já faz validações)
   Object.assign(rules, req.body.rules || {});
   Object.assign(messages, req.body.messages || {});
 
