@@ -14,21 +14,24 @@ const qrDataUrlFn = async (qr) => (qr ? qrDataUrl(qr) : null);
 // Base do projeto (Railway usa /app)
 const BASE_DIR = __dirname;
 
+// ✅ Em Railway, recomenda montar um Volume em /app/data
 const DATA_BASE = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
   : path.join(BASE_DIR, 'data');
 
+// Auth dentro do data (persistente com volume)
 const AUTH_BASE = process.env.AUTH_DIR
   ? path.resolve(process.env.AUTH_DIR)
   : path.join(DATA_BASE, 'auth');
 
-const BOT_IDS = ['v1', 'v2', 'v3', 'v4', 'v5'];
+const BOT_IDS = ['v1','v2','v3','v4','v5'];
 
-// ------- storage -------
+// ------- Files -------
 const EVENTS_FILE = path.join(DATA_BASE, 'events.json');
 const USERS_FILE = path.join(DATA_BASE, 'users.json');
 const SCHEDULES_FILE = path.join(DATA_BASE, 'schedules.json');
 
+// ✅ garante estrutura de pastas/arquivos antes de qualquer coisa
 function ensureBaseStorage() {
   try {
     fs.mkdirSync(DATA_BASE, { recursive: true });
@@ -42,7 +45,7 @@ function ensureBaseStorage() {
     if (!fs.existsSync(EVENTS_FILE)) fs.writeFileSync(EVENTS_FILE, '[]', 'utf8');
     if (!fs.existsSync(SCHEDULES_FILE)) fs.writeFileSync(SCHEDULES_FILE, '[]', 'utf8');
   } catch (e) {
-    console.error('[BOOT] Falha ao preparar pastas:', e?.message || e);
+    console.error('[BOOT] Falha ao preparar pastas de dados:', e?.message || e);
   }
 }
 ensureBaseStorage();
@@ -58,8 +61,9 @@ function appendEvent(evt) {
   }
 }
 
-// ------- bots (lazy) -------
-const bots = {};
+// ------- bots (lazy init) -------
+const bots = {}; // { [botId]: botInstance }
+
 function getBot(botId) {
   const id = BOT_IDS.includes(botId) ? botId : 'v1';
   if (!bots[id]) {
@@ -67,6 +71,7 @@ function getBot(botId) {
       fs.mkdirSync(path.join(AUTH_BASE, id), { recursive: true });
       fs.mkdirSync(path.join(DATA_BASE, id), { recursive: true });
     } catch (_) {}
+
     bots[id] = createBot({
       botId: id,
       baseDir: BASE_DIR,
@@ -81,11 +86,12 @@ function getBot(botId) {
 function loadUsers(){ return loadJSON(USERS_FILE, {}); }
 function saveUsers(u){ return saveJSON(USERS_FILE, u); }
 
+// cria usuários padrão se users.json não existir (não sobrescreve)
 (function ensureDefaultUsers(){
   try {
     if (fs.existsSync(USERS_FILE)) return;
     const seed = {
-      admin: { role: 'admin', botId: '*', pass: 'admin123' },
+      admin: { role: 'admin', botId: '*', pass: 'admin' }, // tu screenshot muestra admin/admin
       v1: { role: 'seller', botId: 'v1', pass: '123' },
       v2: { role: 'seller', botId: 'v2', pass: '123' },
       v3: { role: 'seller', botId: 'v3', pass: '123' },
@@ -93,9 +99,9 @@ function saveUsers(u){ return saveJSON(USERS_FILE, u); }
       v5: { role: 'seller', botId: 'v5', pass: '123' },
     };
     saveJSON(USERS_FILE, seed);
-    console.log('[BOOT] users.json criado (seed).');
+    console.log('[BOOT] users.json criado com usuários padrão.');
   } catch (e) {
-    console.error('[BOOT] seed users fail:', e?.message || e);
+    console.error('[BOOT] Falha ao criar users.json:', e?.message || e);
   }
 })();
 
@@ -134,63 +140,60 @@ function pickBot(req){
   return { botId, allowed, bot: getBot(botId) };
 }
 
-// ------- scheduler (persistente) -------
-function loadSchedules() { return loadJSON(SCHEDULES_FILE, []); }
-function saveSchedules(arr) { return saveJSON(SCHEDULES_FILE, arr); }
-
-function newId() {
-  return Math.random().toString(36).slice(2, 8) + '-' + Date.now().toString(36);
+function renderPage(req,res,{ title, bodyHtml, footerHtml }){
+  res.send(layoutMobile({
+    title,
+    user: { name: req.user.username, role: req.user.role, username: req.user.username },
+    username: req.user.username,
+    role: req.user.role,
+    bodyHtml,
+    footerHtml
+  }));
 }
 
-function brPhoneToJid(phone) {
-  // acepta: 5511999999999 / 11 99999-9999 / +55...
-  const digits = String(phone || '').replace(/\D/g, '');
+// ------- schedules (persistente) -------
+function loadSchedules(){ return loadJSON(SCHEDULES_FILE, []); }
+function saveSchedules(arr){ return saveJSON(SCHEDULES_FILE, arr); }
+
+function newId(){
+  return Math.random().toString(36).slice(2,8) + '-' + Date.now().toString(36);
+}
+
+function safeJSONParse(maybeStr, fallback){
+  try{
+    if (typeof maybeStr === 'string') return JSON.parse(maybeStr);
+    if (typeof maybeStr === 'object' && maybeStr) return maybeStr;
+    return fallback;
+  }catch{ return fallback; }
+}
+
+function brPhoneToJid(phone){
+  const digits = String(phone || '').replace(/\D/g,'');
   if (!digits) return null;
-  // Si no tiene 55, asumimos Brasil
   const full = digits.startsWith('55') ? digits : ('55' + digits);
   return full + '@s.whatsapp.net';
 }
 
-// 🔥 Intento de envío: auto-detect de métodos del botCore
-async function sendTextWithBot(bot, toJid, text) {
-  if (!bot || !toJid || !text) throw new Error('missing params');
-
-  // posibles nombres (depende tu botCore)
-  const candidates = [
-    'sendText',
-    'sendMessage',
-    'send',
-    'enqueueMessage',
-    'queueMessage',
-    'sendOut',
-  ];
-
+// 🔥 intento automático de envío según tu botCore
+async function sendTextWithBot(bot, toJid, text){
+  const candidates = ['sendText','sendMessage','send','enqueueMessage','queueMessage','sendOut'];
   for (const fn of candidates) {
-    if (typeof bot[fn] === 'function') {
-      // casos más comunes:
-      // - sendText(jid, text)
-      // - sendMessage(jid, {text})
-      // - enqueueMessage({to, text})
+    if (typeof bot?.[fn] === 'function') {
       try {
         if (fn === 'sendMessage') return await bot[fn](toJid, { text });
         if (fn === 'enqueueMessage' || fn === 'queueMessage') return await bot[fn]({ to: toJid, text });
         return await bot[fn](toJid, text);
-      } catch (e) {
-        // probamos siguiente
-      }
+      } catch (_) {}
     }
   }
-
-  // último intento: si bot tiene sock (Baileys)
-  if (bot.sock && typeof bot.sock.sendMessage === 'function') {
+  if (bot?.sock && typeof bot.sock.sendMessage === 'function') {
     return await bot.sock.sendMessage(toJid, { text });
   }
-
   throw new Error('BotCore sem método de envio detectado (sendText/sendMessage/enqueueMessage)');
 }
 
-// corre cada 10s
-async function schedulerTick() {
+// scheduler tick cada 10s
+async function schedulerTick(){
   const now = Date.now();
   const arr = loadSchedules();
   let changed = false;
@@ -200,7 +203,6 @@ async function schedulerTick() {
     if (!job.runAt) continue;
     if (Number(job.runAt) > now) continue;
 
-    // ejecutar
     job.status = 'running';
     job.startedAt = new Date().toISOString();
     changed = true;
@@ -235,10 +237,12 @@ async function schedulerTick() {
 }
 
 setInterval(() => {
-  schedulerTick().catch((e) => console.error('[schedulerTick]', e?.message || e));
+  schedulerTick().catch((e)=>console.error('[schedulerTick]', e?.message || e));
 }, 10000);
 
-// ---------- app ----------
+// =======================
+// Express app
+// =======================
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -255,7 +259,7 @@ app.get('/health', (req,res)=>res.status(200).send('ok'));
 app.get('/', (req,res)=>res.redirect('/m'));
 app.get('/app', requireAuth, (req,res)=>res.sendFile(path.join(__dirname,'public','app','index.html')));
 
-// ------- auth -------
+// ------- AUTH -------
 app.get('/login', (req,res)=>{
   const html = `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Login</title>
@@ -275,7 +279,7 @@ app.get('/login', (req,res)=>{
       <label>Usuário</label><input name="username" placeholder="admin / v1 / v2 ..." required/>
       <label>Senha</label><input name="password" type="password" required/>
       <button type="submit">Entrar</button>
-      <div class="muted">Dica: admin/admin123 · v1/123 ...</div>
+      <div class="muted">Dica: admin/admin · v1/123 ...</div>
     </form>
   </div></div></body></html>`;
   res.send(html);
@@ -295,44 +299,102 @@ app.get('/logout', (req,res)=>{
   req.session.destroy(()=>res.redirect('/login'));
 });
 
-// ------- API base -------
+// ------- API -------
 app.get('/api/status', requireAuth, async (req,res)=>{
   const botId = getSelectedBotId({ user: req.user, query: { botId: req.query.botId } });
   const st = getBot(botId).getStatus?.() || {};
   const qr = st.qr || null;
-  const qrData = await qrDataUrlFn(qr);
-  res.json({ botId, connected: !!st.connected, enabled: !!st.enabled, queueSize: st.queueSize ?? 0, qrDataUrl: qrData });
+  const qrDataUrl = await qrDataUrlFn(qr);
+  res.json({ botId, connected: !!st.connected, enabled: !!st.enabled, queueSize: st.queueSize ?? 0, qrDataUrl });
 });
 
 app.post('/api/toggle-connect', requireAuth, async (req,res)=>{
-  const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
-  const b = getBot(botId);
-  const st = b.getStatus?.() || {};
-  try {
+  try{
+    const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
+    const b = getBot(botId);
+    const st = b.getStatus?.() || {};
     if (st.connected) await b.disconnect?.();
     else await b.connect?.();
-  } catch (e) {
-    console.error('[toggle-connect]', e?.message || e);
+    res.json({ ok:true });
+  }catch(e){
+    res.status(500).json({ ok:false, error: String(e?.message || e) });
   }
-  res.json({ ok:true });
 });
 
 app.post('/api/toggle-enabled', requireAuth, (req,res)=>{
-  const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
+  try{
+    const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
+    const b = getBot(botId);
+    const st = b.getStatus?.() || {};
+    b.setEnabled?.(!st.enabled);
+    res.json({ ok:true });
+  }catch(e){
+    res.status(500).json({ ok:false, error: String(e?.message || e) });
+  }
+});
+
+// Stats simples
+app.get('/api/stats', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId({ user: req.user, query: { botId: req.query.botId } });
   const b = getBot(botId);
-  const st = b.getStatus?.() || {};
-  try { b.setEnabled?.(!st.enabled); } catch(e) {}
+
+  const rules = b.getConfig?.()?.rules || { minYearFollowUp: 2022 };
+  const minYear = Number(rules.minYearFollowUp || 2022);
+
+  const events = loadJSON(EVENTS_FILE, []);
+  const totalSent = events.filter(e => e.botId === botId && (e.action === 'auto_sent' || e.action === 'scheduled_sent')).length;
+
+  const leads = b.getLeads?.() || {};
+  let below = 0, atOrAbove = 0;
+  for (const lead of Object.values(leads||{})) {
+    const y = Number(lead.year || lead.ano || 0);
+    if (!y) continue;
+    if (y < minYear) below += 1;
+    else atOrAbove += 1;
+  }
+
+  res.json({ botId, minYearFollowUp: minYear, totalMessagesSent: totalSent, carsBelowMinYear: below, carsAtOrAboveMinYear: atOrAbove });
+});
+
+// Users CRUD (admin)
+app.get('/api/users', requireAuth, (req,res)=>{
+  if (req.user.role !== 'admin') return res.status(403).json({error:'forbidden'});
+  res.json({ users: loadUsers() });
+});
+
+app.post('/api/users/upsert', requireAuth, (req,res)=>{
+  if (req.user.role !== 'admin') return res.status(403).json({error:'forbidden'});
+  const { username, password, botId, role } = req.body || {};
+  if (!username) return res.status(400).json({error:'missing username'});
+  if (role && !['admin','seller'].includes(role)) return res.status(400).json({error:'bad role'});
+  if (botId && !BOT_IDS.includes(botId)) return res.status(400).json({error:'bad botId'});
+
+  const users = loadUsers();
+  const cur = users[username] || {};
+  users[username] = {
+    role: role || cur.role || 'seller',
+    botId: (role==='admin') ? '*' : (botId || cur.botId || 'v1'),
+    pass: (password && String(password).trim()) ? String(password).trim() : (cur.pass || cur.password || '123')
+  };
+  saveUsers(users);
   res.json({ ok:true });
 });
 
-// ------- SCHEDULER API -------
+app.post('/api/users/delete', requireAuth, (req,res)=>{
+  if (req.user.role !== 'admin') return res.status(403).json({error:'forbidden'});
+  const { username } = req.body || {};
+  if (!username) return res.status(400).json({error:'missing username'});
+  const users = loadUsers();
+  delete users[username];
+  saveUsers(users);
+  res.json({ ok:true });
+});
+
+// Scheduler API
 app.get('/api/schedules', requireAuth, (req,res)=>{
   const arr = loadSchedules();
-  // admin ve todo; seller ve su bot
   const allowed = allowedBotIds(req.user);
-  const out = (req.user.role === 'admin')
-    ? arr
-    : arr.filter(j => allowed.includes(j.botId));
+  const out = (req.user.role === 'admin') ? arr : arr.filter(j => allowed.includes(j.botId));
   res.json({ jobs: out.sort((a,b)=>Number(b.runAt||0)-Number(a.runAt||0)) });
 });
 
@@ -374,38 +436,24 @@ app.post('/api/schedules/delete', requireAuth, (req,res)=>{
   const allowed = allowedBotIds(req.user);
   if (req.user.role !== 'admin' && !allowed.includes(job.botId)) return res.status(403).json({ error:'forbidden' });
 
-  const next = arr.filter(j => j.id !== id);
-  saveSchedules(next);
+  saveSchedules(arr.filter(j => j.id !== id));
   appendEvent({ botId: job.botId, action: 'scheduled_deleted', phone: job.phone, jobId: job.id });
   res.json({ ok:true });
 });
 
-// ------- PAGES -------
-function renderPage(req,res,{ title, bodyHtml, footerHtml }){
-  res.send(layoutMobile({
-    title,
-    user: { name: req.user.username, role: req.user.role, username: req.user.username },
-    username: req.user.username,
-    role: req.user.role,
-    bodyHtml,
-    footerHtml
-  }));
-}
+// ------- PAGES (MOBILE) -------
 
-// Home /m
+// Painel
 app.get('/m', requireAuth, async (req,res)=>{
   const { botId, allowed, bot } = pickBot(req);
   const st = bot.getStatus?.() || {};
-  const qr = st.qr || null;
-  const qrUrl = await qrDataUrlFn(qr);
+  const qrUrl = await qrDataUrlFn(st.qr || null);
 
-  const options = allowed.map(id =>
-    `<option value="${id}" ${id===botId?'selected':''}>${id}</option>`
-  ).join('');
+  const options = allowed.map(id => `<option value="${id}" ${id===botId?'selected':''}>${id}</option>`).join('');
 
   const bodyHtml = `
     <div class="card">
-      <div class="row" style="justify-content:space-between;align-items:center">
+      <div class="row" style="align-items:center;justify-content:space-between">
         <div class="row" style="align-items:center">
           <div class="muted">Bot</div>
           <select onchange="location.href='/m?botId='+this.value">${options}</select>
@@ -427,21 +475,209 @@ app.get('/m', requireAuth, async (req,res)=>{
         <div class="qr" style="margin-top:10px">
           ${qrUrl ? `<img src="${qrUrl}" alt="QR"/>` : `<div class="muted">Sem QR agora.</div>`}
         </div>
+        <div id="connectErr" class="muted" style="margin-top:10px"></div>
       </div>
     </div>
 
     <script>
       async function postJSON(url, body){
-        await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+        const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+        const j = await r.json().catch(()=>({}));
+        if(!r.ok){ throw new Error(j.error || 'erro'); }
+        return j;
       }
-      async function toggleConnect(botId){ await postJSON('/api/toggle-connect',{botId}); location.reload(); }
-      async function toggleEnabled(botId){ await postJSON('/api/toggle-enabled',{botId}); location.reload(); }
+      async function toggleConnect(botId){
+        try{
+          await postJSON('/api/toggle-connect',{botId});
+          location.reload();
+        }catch(e){
+          document.getElementById('connectErr').textContent = 'Erro ao conectar: ' + e.message;
+        }
+      }
+      async function toggleEnabled(botId){
+        try{
+          await postJSON('/api/toggle-enabled',{botId});
+          location.reload();
+        }catch(e){
+          alert(e.message);
+        }
+      }
     </script>
   `;
+
   renderPage(req,res,{ title:`Painel (${botId})`, bodyHtml });
 });
 
-// ✅ Programar mensagem (UI REAL)
+// Mensagens
+app.get('/m/messages', requireAuth, (req,res)=>{
+  const { botId, bot } = pickBot(req);
+  const cfg = bot.getConfig?.() || {};
+  const bodyHtml = `
+    <div class="card">
+      <h3>📝 Mensagens (${htmlEscape(botId)})</h3>
+      <div class="muted">Edite o JSON.</div>
+      <form method="POST" action="/save">
+        <input type="hidden" name="botId" value="${htmlEscape(botId)}"/>
+        <label>Messages (JSON)</label>
+        <textarea name="messages">${htmlEscape(JSON.stringify(cfg.messages || {}, null, 2))}</textarea>
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Salvar</button>
+      </form>
+    </div>
+  `;
+  renderPage(req,res,{ title:`Mensagens (${botId})`, bodyHtml });
+});
+
+// Regras
+app.get('/m/rules', requireAuth, (req,res)=>{
+  const { botId, bot } = pickBot(req);
+  const cfg = bot.getConfig?.() || {};
+  const bodyHtml = `
+    <div class="card">
+      <h3>⚙️ Regras (${htmlEscape(botId)})</h3>
+      <form method="POST" action="/save">
+        <input type="hidden" name="botId" value="${htmlEscape(botId)}"/>
+        <label>Rules (JSON)</label>
+        <textarea name="rules">${htmlEscape(JSON.stringify(cfg.rules || {}, null, 2))}</textarea>
+        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Salvar</button>
+      </form>
+    </div>
+  `;
+  renderPage(req,res,{ title:`Regras (${botId})`, bodyHtml });
+});
+
+// Save config (rules/messages)
+app.post('/save', requireAuth, (req,res)=>{
+  const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
+  const b = getBot(botId);
+
+  const cfg = b.getConfig?.() || {};
+  const rulesOld = cfg.rules || {};
+  const messagesOld = cfg.messages || {};
+
+  const rulesNew = safeJSONParse(req.body.rules, rulesOld);
+  const messagesNew = safeJSONParse(req.body.messages, messagesOld);
+
+  try { b.setConfig?.({ rules: rulesNew, messages: messagesNew }); } catch(_) {}
+  res.redirect(req.headers.referer || '/m');
+});
+
+// Leads
+app.get('/m/leads', requireAuth, (req,res)=>{
+  const { botId, bot } = pickBot(req);
+  const leads = bot.getLeads?.() || {};
+  const rows = Object.entries(leads).slice(0, 300).map(([id, l]) => {
+    const name = l.name || l.nome || '';
+    const phone = l.phone || l.telefone || id;
+    const year = l.year || l.ano || '';
+    const stage = l.stage || l.funil || l.status || '';
+    return `<tr>
+      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(phone)}</td>
+      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(name)}</td>
+      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(year)}</td>
+      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(stage)}</td>
+    </tr>`;
+  }).join('');
+
+  const bodyHtml = `
+    <div class="card">
+      <h3>👥 Leads (${htmlEscape(botId)})</h3>
+      <div class="muted">Mostrando até 300.</div>
+      <div style="overflow:auto;margin-top:10px">
+        <table style="width:100%;border-collapse:collapse">
+          <thead>
+            <tr style="color:#94a3b8;font-size:12px;text-align:left">
+              <th style="border-bottom:1px solid #1f2a44;padding:8px">Telefone</th>
+              <th style="border-bottom:1px solid #1f2a44;padding:8px">Nome</th>
+              <th style="border-bottom:1px solid #1f2a44;padding:8px">Ano</th>
+              <th style="border-bottom:1px solid #1f2a44;padding:8px">Etapa</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows || `<tr><td colspan="4" class="muted" style="padding:10px">Sem leads (ou getLeads não existe).</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+  renderPage(req,res,{ title:`Leads (${botId})`, bodyHtml });
+});
+
+// Dashboard
+app.get('/m/dashboard', requireAuth, (req,res)=>{
+  const { botId } = pickBot(req);
+  const bodyHtml = `
+    <div class="card">
+      <h3>📈 Dashboard (${htmlEscape(botId)})</h3>
+      <div id="dashBox" class="muted" style="margin-top:10px">Carregando…</div>
+    </div>
+    <script>
+      (async ()=>{
+        const r = await fetch('/api/stats?botId=${encodeURIComponent(botId)}');
+        const j = await r.json();
+        document.getElementById('dashBox').innerHTML =
+          '<b>Mensagens auto:</b> ' + (j.totalMessagesSent ?? 0) + '<br>' +
+          '<b>Ano mínimo:</b> ' + (j.minYearFollowUp ?? '-') + '<br>' +
+          '<b>Carros abaixo:</b> ' + (j.carsBelowMinYear ?? 0) + '<br>' +
+          '<b>Carros OK:</b> ' + (j.carsAtOrAboveMinYear ?? 0);
+      })();
+    </script>
+  `;
+  renderPage(req,res,{ title:`Dashboard (${botId})`, bodyHtml });
+});
+
+// Estatísticas
+app.get('/m/stats', requireAuth, (req,res)=>{
+  const { botId } = pickBot(req);
+  const bodyHtml = `
+    <div class="card">
+      <h3>📊 Estatísticas (${htmlEscape(botId)})</h3>
+      <div id="statsFull" class="muted" style="margin-top:10px">Carregando…</div>
+    </div>
+    <script>
+      (async ()=>{
+        const r = await fetch('/api/stats?botId=${encodeURIComponent(botId)}');
+        const j = await r.json();
+        document.getElementById('statsFull').innerHTML =
+          '<b>Mensagens auto:</b> ' + (j.totalMessagesSent ?? 0) + '<br>' +
+          '<b>Ano mínimo:</b> ' + (j.minYearFollowUp ?? '-') + '<br>' +
+          '<b>Carros abaixo:</b> ' + (j.carsBelowMinYear ?? 0) + '<br>' +
+          '<b>Carros OK:</b> ' + (j.carsAtOrAboveMinYear ?? 0);
+      })();
+    </script>
+  `;
+  renderPage(req,res,{ title:`Estatísticas (${botId})`, bodyHtml });
+});
+
+// Cotizar
+app.get('/m/quote', requireAuth, (req,res)=>{
+  const { botId } = pickBot(req);
+  const bodyHtml = `
+    <div class="card">
+      <h3>💰 Cotizar (${htmlEscape(botId)})</h3>
+      <div class="muted">Tela pronta. Se você quer a cotização automática, me manda a lógica antiga/print e eu encaixo aqui.</div>
+    </div>
+  `;
+  renderPage(req,res,{ title:`Cotizar (${botId})`, bodyHtml });
+});
+
+// Comandos
+app.get('/m/commands', requireAuth, (req,res)=>{
+  const { botId } = pickBot(req);
+  const bodyHtml = `
+    <div class="card">
+      <h3>⌨️ Comandos (${htmlEscape(botId)})</h3>
+      <pre style="white-space:pre-wrap;word-break:break-word;background:#0b1220;border:1px solid #1f2a44;border-radius:12px;padding:12px;margin-top:10px">
+#okok    -> marcar lead como OK
+#stop    -> parar automação
+#follow  -> voltar para o funil
+#humano  -> transferir para humano
+      </pre>
+    </div>
+  `;
+  renderPage(req,res,{ title:`Comandos (${botId})`, bodyHtml });
+});
+
+// Programar (agenda real)
 app.get('/m/program', requireAuth, (req,res)=>{
   const { botId, allowed } = pickBot(req);
   const botOptions = allowed.map(id => `<option value="${id}" ${id===botId?'selected':''}>${id}</option>`).join('');
@@ -449,7 +685,7 @@ app.get('/m/program', requireAuth, (req,res)=>{
   const bodyHtml = `
   <div class="card">
     <h3>⏱️ Programar Mensagem</h3>
-    <div class="muted">Agenda um envio automático (fica salvo no data/schedules.json).</div>
+    <div class="muted">Agenda um envio automático (salva em data/schedules.json).</div>
 
     <label>Bot</label>
     <select id="botIdSel">${botOptions}</select>
@@ -457,7 +693,7 @@ app.get('/m/program', requireAuth, (req,res)=>{
     <label>Telefone (com DDD)</label>
     <input id="phone" placeholder="11 99999-9999" />
 
-    <label>Data e hora (Brasil)</label>
+    <label>Data e hora</label>
     <input id="when" type="datetime-local"/>
 
     <label>Mensagem</label>
@@ -467,6 +703,8 @@ app.get('/m/program', requireAuth, (req,res)=>{
       <button class="btn btn-primary" onclick="addJob()">Agendar</button>
       <button class="btn btn-ghost" onclick="loadJobs()">Atualizar lista</button>
     </div>
+
+    <div id="progErr" class="muted" style="margin-top:10px"></div>
   </div>
 
   <div class="card">
@@ -476,7 +714,6 @@ app.get('/m/program', requireAuth, (req,res)=>{
 
   <script>
     function toTs(dtLocal){
-      // dtLocal "YYYY-MM-DDTHH:MM"
       if(!dtLocal) return null;
       const d = new Date(dtLocal);
       const ts = d.getTime();
@@ -485,7 +722,9 @@ app.get('/m/program', requireAuth, (req,res)=>{
 
     async function postJSON(url, body){
       const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
-      return r.json().catch(()=>({}));
+      const j = await r.json().catch(()=>({}));
+      if(!r.ok){ throw new Error(j.error || 'erro'); }
+      return j;
     }
 
     async function loadJobs(){
@@ -510,15 +749,19 @@ app.get('/m/program', requireAuth, (req,res)=>{
     }
 
     async function addJob(){
-      const botId = document.getElementById('botIdSel').value;
-      const phone = document.getElementById('phone').value;
-      const text = document.getElementById('text').value;
-      const when = document.getElementById('when').value;
-      const runAt = toTs(when);
-      const out = await postJSON('/api/schedules/add',{ botId, phone, text, runAt });
-      if(out && out.error) alert(out.error);
-      document.getElementById('text').value = '';
-      await loadJobs();
+      document.getElementById('progErr').textContent = '';
+      try{
+        const botId = document.getElementById('botIdSel').value;
+        const phone = document.getElementById('phone').value;
+        const text = document.getElementById('text').value;
+        const when = document.getElementById('when').value;
+        const runAt = toTs(when);
+        await postJSON('/api/schedules/add',{ botId, phone, text, runAt });
+        document.getElementById('text').value = '';
+        await loadJobs();
+      }catch(e){
+        document.getElementById('progErr').textContent = 'Erro: ' + e.message;
+      }
     }
 
     async function delJob(id){
@@ -529,19 +772,18 @@ app.get('/m/program', requireAuth, (req,res)=>{
     loadJobs();
   </script>
   `;
-
   renderPage(req,res,{ title:`Programar (${botId})`, bodyHtml });
 });
 
-// ✅ Agenda = vista del scheduler (misma lista, otra pestaña)
+// Agenda (misma lista con refresh)
 app.get('/m/agenda', requireAuth, (req,res)=>{
   const { botId } = pickBot(req);
   const bodyHtml = `
     <div class="card">
       <h3>🗓️ Agenda</h3>
-      <div class="muted">Aqui você vê tudo que está pendente / executando / concluído.</div>
+      <div class="muted">Pendentes / Done / Error (atualiza a cada 15s).</div>
       <div style="margin-top:10px">
-        <a class="btn btn-primary" href="/m/program">Ir para Programar Mensagem</a>
+        <a class="btn btn-primary" href="/m/program">Ir para Programar</a>
       </div>
     </div>
     <div class="card">
@@ -551,7 +793,9 @@ app.get('/m/agenda', requireAuth, (req,res)=>{
     <script>
       async function postJSON(url, body){
         const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
-        return r.json().catch(()=>({}));
+        const j = await r.json().catch(()=>({}));
+        if(!r.ok){ throw new Error(j.error || 'erro'); }
+        return j;
       }
       async function loadJobs(){
         const r = await fetch('/api/schedules');
@@ -584,108 +828,50 @@ app.get('/m/agenda', requireAuth, (req,res)=>{
   renderPage(req,res,{ title:`Agenda (${botId})`, bodyHtml });
 });
 
-// Mantengo otras páginas como estaban (para que no rompa)
-app.get('/m/messages', requireAuth, (req,res)=>{
-  const { botId, bot } = pickBot(req);
-  const cfg = bot.getConfig?.() || {};
-  const bodyHtml = `
-    <div class="card">
-      <h3>📝 Mensagens (${htmlEscape(botId)})</h3>
-      <div class="muted">Aqui continua a edição JSON (seu botCore usa isso).</div>
-      <form method="POST" action="/save">
-        <input type="hidden" name="botId" value="${htmlEscape(botId)}"/>
-        <label>Messages (JSON)</label>
-        <textarea name="messages">${htmlEscape(JSON.stringify(cfg.messages || {}, null, 2))}</textarea>
-        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Salvar</button>
-      </form>
-    </div>
-  `;
-  renderPage(req,res,{ title:`Mensagens (${botId})`, bodyHtml });
-});
+// Users page (admin)
+app.get('/m/users', requireAuth, (req,res)=>{
+  if (req.user.role !== 'admin') return res.redirect('/m');
 
-app.get('/m/leads', requireAuth, (req,res)=>{
-  const { botId, bot } = pickBot(req);
-  const leads = bot.getLeads?.() || {};
-  const rows = Object.entries(leads).slice(0,300).map(([id,l])=>{
-    const name = l.name || l.nome || '';
-    const phone = l.phone || l.telefone || id;
-    const year = l.year || l.ano || '';
-    const stage = l.stage || l.funil || l.status || '';
-    return `<tr>
-      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(phone)}</td>
-      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(name)}</td>
-      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(year)}</td>
-      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(stage)}</td>
-    </tr>`;
-  }).join('');
+  const users = loadUsers();
+  const rows = Object.entries(users).map(([uname, u]) => `
+    <tr>
+      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(uname)}</td>
+      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(u.role || '')}</td>
+      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(u.botId || '')}</td>
+      <td style="border-bottom:1px solid #1f2a44;padding:8px">${htmlEscape(u.pass || '')}</td>
+    </tr>
+  `).join('');
+
   const bodyHtml = `
     <div class="card">
-      <h3>👥 Leads (${htmlEscape(botId)})</h3>
+      <h3>👤 Usuários</h3>
+      <div class="muted">Lista do data/users.json</div>
       <div style="overflow:auto;margin-top:10px">
         <table style="width:100%;border-collapse:collapse">
           <thead>
             <tr style="color:#94a3b8;font-size:12px;text-align:left">
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Telefone</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Nome</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Ano</th>
-              <th style="border-bottom:1px solid #1f2a44;padding:8px">Etapa</th>
+              <th style="border-bottom:1px solid #1f2a44;padding:8px">Usuário</th>
+              <th style="border-bottom:1px solid #1f2a44;padding:8px">Role</th>
+              <th style="border-bottom:1px solid #1f2a44;padding:8px">Bot</th>
+              <th style="border-bottom:1px solid #1f2a44;padding:8px">Senha</th>
             </tr>
           </thead>
-          <tbody>${rows || `<tr><td colspan="4" class="muted" style="padding:10px">Sem leads (ou getLeads não existe).</td></tr>`}</tbody>
+          <tbody>${rows}</tbody>
         </table>
       </div>
     </div>
   `;
-  renderPage(req,res,{ title:`Leads (${botId})`, bodyHtml });
+  renderPage(req,res,{ title:'Usuários', bodyHtml });
 });
 
-app.get('/m/rules', requireAuth, (req,res)=>{
-  const { botId, bot } = pickBot(req);
-  const cfg = bot.getConfig?.() || {};
-  const bodyHtml = `
-    <div class="card">
-      <h3>⚙️ Regras (${htmlEscape(botId)})</h3>
-      <form method="POST" action="/save">
-        <input type="hidden" name="botId" value="${htmlEscape(botId)}"/>
-        <label>Rules (JSON)</label>
-        <textarea name="rules">${htmlEscape(JSON.stringify(cfg.rules || {}, null, 2))}</textarea>
-        <button class="btn btn-primary" type="submit" style="margin-top:10px;width:100%">Salvar</button>
-      </form>
-    </div>
-  `;
-  renderPage(req,res,{ title:`Regras (${botId})`, bodyHtml });
-});
-
-function safeJSONParse(maybeStr, fallback){
-  try{
-    if (typeof maybeStr === 'string') return JSON.parse(maybeStr);
-    if (typeof maybeStr === 'object' && maybeStr) return maybeStr;
-    return fallback;
-  }catch{ return fallback; }
-}
-
-app.post('/save', requireAuth, (req,res)=>{
-  const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
-  const b = getBot(botId);
-
-  const cfg = b.getConfig?.() || {};
-  const rulesOld = cfg.rules || {};
-  const messagesOld = cfg.messages || {};
-
-  const rulesNew = safeJSONParse(req.body.rules, rulesOld);
-  const messagesNew = safeJSONParse(req.body.messages, messagesOld);
-
-  try { b.setConfig?.({ rules: rulesNew, messages: messagesNew }); } catch(e) {}
-
-  res.redirect(req.headers.referer || '/m');
-});
+// /admin atalho
+app.get('/admin', requireAuth, (req,res)=>res.redirect('/d'));
 
 // Desktop
 app.get('/d', requireAuth, async (req,res)=>{
   const { botId, bot } = pickBot(req);
   const st = bot.getStatus?.() || {};
-  const qr = st.qr || null;
-  const qrUrl = await qrDataUrlFn(qr);
+  const qrUrl = await qrDataUrlFn(st.qr || null);
 
   const bodyHtml = `
     <div class="card">
