@@ -1,0 +1,12 @@
+{
+  "step0": "Olá! Tudo bem? Aqui é da Iron Glass 😊\nPassando só para dar continuidade ao seu atendimento. Se ainda tiver interesse, me chama aqui que eu te ajudo com tudo.",
+  "step1": "Oi! Aqui é da Iron Glass novamente 😉\nQueria saber se ainda tem interesse na proteção dos vidros do seu carro. Qualquer dúvida, pode falar comigo por aqui.",
+  "step2": "Tudo bem? Aqui é da Iron Glass 🛡️\nNão quero te incomodar, só lembrar que aquela condição especial ainda está disponível. Se fizer sentido para você, me chama.",
+  "step3": "Olá! Aqui é da Iron Glass 🚙\nEsse é o último lembrete dessa primeira sequência. Se ainda quiser proteger seu carro, será um prazer te atender.",
+  "extra": "Olá! Tudo bem? Aqui é da Iron Glass 😊\nSó passando a cada 30 dias para saber se já é um bom momento para retomarmos a conversa sobre a proteção dos vidros do seu carro.",
+  "postSale30": "Olá! Aqui é da Iron Glass 🛡️\nPassando para saber se deu tudo certo com a sua proteção e se você conhece alguém que também queira proteger os vidros do carro.\nSua indicação é muito importante para nós! 😊",
+  "agenda0": "📅 Lembrete Iron Glass: falta 7 dias para seu agendamento.\nQualquer dúvida antes do dia, estou por aqui. 😉",
+  "agenda1": "📅 Lembrete Iron Glass: faltam 3 dias para seu agendamento.\nSe precisar ajustar algo, me avise por aqui.",
+  "agenda2": "📅 Lembrete Iron Glass: é amanhã o seu agendamento.\nTe esperamos no horário combinado. 🚗🛡️",
+  "confirmTemplate": "📅 Confirmação de Agendamento - Iron Glass\n\nPrezado cliente,\nconfirmamos seu agendamento para o dia {{DATA}} às {{HORA}}.\n\n🚗 Veículo: {{VEICULO}}\n🛡️ Produto: {{PRODUTO}}\n💰 Valor total: {{VALOR}}\n💵 Sinal recebido: {{SINAL}} ({{PAGAMENTO}})\n\nAgradecemos a confiança em Iron Glass."
+}

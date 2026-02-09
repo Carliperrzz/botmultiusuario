@@ -1,0 +1,38 @@
+{
+  "admin": {
+    "name": "Carlos",
+    "pass": "admin123",
+    "role": "admin",
+    "botId": "*"
+  },
+  "v1": {
+    "name": "Vendedor 1",
+    "pass": "123",
+    "role": "seller",
+    "botId": "v1"
+  },
+  "v2": {
+    "name": "Vendedor 2",
+    "pass": "123",
+    "role": "seller",
+    "botId": "v2"
+  },
+  "v3": {
+    "name": "Vendedor 3",
+    "pass": "123",
+    "role": "seller",
+    "botId": "v3"
+  },
+  "v4": {
+    "name": "Vendedor 4",
+    "pass": "123",
+    "role": "seller",
+    "botId": "v4"
+  },
+  "v5": {
+    "name": "Vendedor 5",
+    "pass": "123",
+    "role": "seller",
+    "botId": "v5"
+  }
+}
