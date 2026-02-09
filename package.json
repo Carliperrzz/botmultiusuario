@@ -1,1 +1,17 @@
-
+{
+  "name": "iron-glass-multibot",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.8",
+    "express": "^4.19.2",
+    "express-session": "^1.17.3",
+    "pino": "^9.3.2",
+    "qrcode": "^1.5.4",
+    "dotenv": "^17.2.4"
+  }
+}
