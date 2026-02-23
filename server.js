@@ -5,194 +5,35 @@ const path = require('path');
 const express = require('express');
 const session = require('express-session');
 
-\
-/**
- * ====== Helpers internos (sin ./src) ======
- * Este server.js es autocontenido para Railway/GitHub (no requiere carpeta src/).
- */
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  DisconnectReason,
-  makeCacheableSignalKeyStore,
-} = require('@whiskeysockets/baileys');
-const Pino = require('pino');
-
-function loadJSON(filePath, fallback) {
-  try {
-    if (!fs.existsSync(filePath)) return fallback;
-    const raw = fs.readFileSync(filePath, 'utf-8');
-    if (!raw.trim()) return fallback;
-    return JSON.parse(raw);
-  } catch (e) {
-    return fallback;
-  }
-}
-
-function saveJSON(filePath, obj) {
-  const dir = path.dirname(filePath);
-  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
-  fs.writeFileSync(filePath, JSON.stringify(obj, null, 2), 'utf-8');
-}
-
-function htmlEscape(s) {
-  return String(s ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-function applyTemplate(tpl, data) {
-  return String(tpl).replace(/\{\{\s*([A-Z0-9_]+)\s*\}\}/gi, (_, k) => {
-    const key = String(k).toUpperCase();
-    return data && data[key] != null ? String(data[key]) : '';
-  });
-}
-
-/**
- * createBot(): crea una instancia por botId, aislada (v1..v5).
- * - Cada bot usa su propia carpeta de authDir (AUTH_DIR/<botId>)
- * - Si se desconecta puede generar QR nuevo SOLO para ese botId.
- */
-function createBot({ botId, baseDir, authDir, eventLogger }) {
-  const state = {
-    botId,
-    enabled: true,
-    connected: false,
-    qr: null,
-    queueSize: 0,
-    lastUpdate: new Date().toISOString(),
-    lastError: null,
-  };
-
-  let sock = null;
-  let connecting = false;
-  let manualDisconnect = false;
-
-  // ✅ por pedido: si un bot se desconecta "por lo que fuere", genera QR nuevo SOLO para ese botId.
-  const AUTO_QR_ON_ANY_DISCONNECT = String(process.env.AUTO_QR_ON_ANY_DISCONNECT ?? 'true').toLowerCase() === 'true';
-
-  function setState(patch) {
-    Object.assign(state, patch, { lastUpdate: new Date().toISOString() });
-  }
-
-  function logEvt(type, payload) {
-    try { eventLogger && eventLogger({ botId, type, payload }); } catch (e) {}
-  }
-
-  async function resetAuthAndReconnect(reason) {
-    try { if (sock) sock.end?.(new Error('reset-auth')); } catch (e) {}
-    sock = null;
-    setState({ connected: false, qr: null });
-
-    // ⚠️ borra SOLO la auth de este botId
-    try { fs.rmSync(authDir, { recursive: true, force: true }); } catch (e) {}
-    try { fs.mkdirSync(authDir, { recursive: true }); } catch (e) {}
-
-    manualDisconnect = false;
-    await connect();
-    logEvt('reset_auth', { reason });
-  }
-
-  async function connect() {
-    if (!state.enabled) return;
-    if (connecting) return;
-    connecting = true;
-    manualDisconnect = false;
-
+function safeRequire(candidates) {
+  let lastErr = null;
+  for (const c of candidates) {
     try {
-      try { fs.mkdirSync(authDir, { recursive: true }); } catch (e) {}
-
-      const { state: authState, saveCreds } = await useMultiFileAuthState(authDir);
-      const { version } = await fetchLatestBaileysVersion();
-
-      sock = makeWASocket({
-        version,
-        printQRInTerminal: false,
-        auth: {
-          creds: authState.creds,
-          keys: makeCacheableSignalKeyStore(authState.keys, Pino({ level: 'silent' })),
-        },
-        logger: Pino({ level: 'silent' }),
-        browser: ['Iron Glass', 'Chrome', '1.0.0'],
-        markOnlineOnConnect: true,
-        generateHighQualityLinkPreview: true,
-      });
-
-      sock.ev.on('creds.update', saveCreds);
-
-      sock.ev.on('connection.update', async (u) => {
-        const { connection, lastDisconnect, qr } = u;
-
-        if (qr) {
-          setState({ qr, lastError: null });
-          logEvt('qr', { present: true });
-        }
-
-        if (connection === 'open') {
-          setState({ connected: true, qr: null, lastError: null });
-          logEvt('open', {});
-        }
-
-        if (connection === 'close') {
-          setState({ connected: false });
-
-          const code = lastDisconnect?.error?.output?.statusCode;
-          const msg = String(lastDisconnect?.error?.message || '');
-          logEvt('close', { code, msg });
-
-          if (manualDisconnect) return;
-
-          if (code === DisconnectReason.loggedOut) {
-            try { await resetAuthAndReconnect('loggedOut'); } catch (e) { setState({ lastError: String(e?.message || e) }); }
-            return;
-          }
-
-          if (AUTO_QR_ON_ANY_DISCONNECT) {
-            try { await resetAuthAndReconnect('any_disconnect'); } catch (e) { setState({ lastError: String(e?.message || e) }); }
-            return;
-          }
-
-          setTimeout(() => connect().catch(() => {}), 2500);
-        }
-      });
-
-      sock.ev.on('messages.upsert', ({ messages, type }) => {
-        if (type !== 'notify') return;
-        const msg = messages?.[0];
-        if (!msg || msg.key?.fromMe) return;
-        logEvt('message', { from: msg.key?.remoteJid });
-      });
-
+      return require(c);
     } catch (e) {
-      setState({ connected: false, lastError: String(e?.message || e) });
-      logEvt('connect_error', { error: String(e?.message || e) });
-    } finally {
-      connecting = false;
+      // Solo ignorar si el módulo que falta es EXACTAMENTE el candidato probado
+      if (e && e.code === 'MODULE_NOT_FOUND') {
+        const msg = String(e.message || '');
+        if (msg.includes(`Cannot find module '${c}'`) || msg.includes(`Cannot find module "${c}"`)) {
+          lastErr = e;
+          continue;
+        }
+      }
+      throw e;
     }
   }
-
-  async function disconnect() {
-    manualDisconnect = true;
-    try { if (sock) sock.end?.(new Error('manual disconnect')); } catch (e) {}
-    try { sock?.ws?.close?.(); } catch (e) {}
-    sock = null;
-    setState({ connected: false });
-    logEvt('manual_disconnect', {});
-  }
-
-  function setEnabled(v) { setState({ enabled: !!v }); }
-  function getStatus() { return { ...state }; }
-  function getConfig() { return { botId, authDir, enabled: state.enabled }; }
-  function getLeads() { return []; }
-
-  return { connect, disconnect, setEnabled, getStatus, getConfig, getLeads };
+  throw lastErr || new Error(`Cannot load any of: ${candidates.join(', ')}`);
 }
 
-// qrDataUrl/layoutMobile/layoutDesktop están más abajo en este mismo archivo
+// ✅ Railway/Linux es case-sensitive: probamos variaciones comunes de nombres
+const utilsMod = safeRequire(['./src/utils', './src/Utils', './src/utils/index']);
+const botCoreMod = safeRequire(['./src/botCore', './src/botcore', './src/BotCore']);
+const panelMod  = safeRequire(['./src/panelTemplates', './src/paneltemplates', './src/PanelTemplates']);
+
+const { loadJSON, saveJSON, htmlEscape, applyTemplate } = utilsMod;
+const { createBot } = botCoreMod;
+const { qrDataUrl, layoutMobile, layoutDesktop } = panelMod;
+
 const qrDataUrlFn = async (qr) => (qr ? qrDataUrl(qr) : null);
 const BASE_DIR = __dirname;
 const DATA_BASE = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(BASE_DIR, 'data');
@@ -295,14 +136,23 @@ function requireAuth(req,res,next){
 
 function allowedBotIds(user){
   if (user.role === 'admin') return BOT_IDS;
-  return [user.botId];
+  return [normBotId(user.botId)];
+}
+
+function normBotId(x){
+  return String(x || '').trim().toLowerCase();
 }
 
 function getSelectedBotId(req){
-  if (req.user.role !== 'admin') return req.user.botId;
-  const q = req.query.botId;
+  // req puede ser Express req o un objeto {user, query, body}
+  const user = req?.user || {};
+  const query = req?.query || {};
+  const body = req?.body || {};
+  if (user.role !== 'admin') return normBotId(user.botId);
+
+  const q = normBotId(query.botId ?? body.botId);
   if (q && BOT_IDS.includes(q)) return q;
-  // default v1
+
   return 'v1';
 }
 
@@ -345,11 +195,12 @@ app.get('/api/me', requireAuth, (req,res)=>{
 });
 
 app.get('/api/status', requireAuth, async (req,res)=>{
-  const botId = getSelectedBotId({ user: req.user, query: { botId: req.query.botId } });
+  const botId = getSelectedBotId({ user: req.user, query: { botId: req.query.botId }, body: req.body });
   const st = bots[botId].getStatus();
   const qr = st.qr || null;
   const qrDataUrl = await qrDataUrlFn(qr);
-  res.json({ botId, connected: st.connected, enabled: st.enabled, queueSize: st.queueSize, qrDataUrl });
+  res.set('Cache-Control','no-store');
+  res.json({ botId, connected: st.connected, enabled: st.enabled, queueSize: st.queueSize, qrDataUrl, lastError: st.lastError || null });
 });
 
 app.post('/api/toggle-connect', requireAuth, async (req,res)=>{
@@ -380,7 +231,7 @@ app.post('/api/toggle-enabled', requireAuth, (req,res)=>{
 
 // Stats: total messages + car-year buckets based on "Regras.minYearFollowUp"
 app.get('/api/stats', requireAuth, (req,res)=>{
-  const botId = getSelectedBotId({ user: req.user, query: { botId: req.query.botId } });
+  const botId = getSelectedBotId({ user: req.user, query: { botId: req.query.botId }, body: req.body });
   const rules = bots[botId].getConfig()?.rules || { minYearFollowUp: 2022 };
   const minYear = Number(rules.minYearFollowUp || 2022);
 
