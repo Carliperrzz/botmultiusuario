@@ -5,9 +5,34 @@ const path = require('path');
 const express = require('express');
 const session = require('express-session');
 
-const { loadJSON, saveJSON, htmlEscape, applyTemplate } = require('./src/utils');
-const { createBot } = require('./src/botCore');
-const { qrDataUrl, layoutMobile, layoutDesktop } = require('./src/panelTemplates');
+function safeRequire(candidates) {
+  let lastErr = null;
+  for (const c of candidates) {
+    try {
+      return require(c);
+    } catch (e) {
+      // Solo ignorar si el módulo que falta es EXACTAMENTE el candidato probado
+      if (e && e.code === 'MODULE_NOT_FOUND') {
+        const msg = String(e.message || '');
+        if (msg.includes(`Cannot find module '${c}'`) || msg.includes(`Cannot find module "${c}"`)) {
+          lastErr = e;
+          continue;
+        }
+      }
+      throw e;
+    }
+  }
+  throw lastErr || new Error(`Cannot load any of: ${candidates.join(', ')}`);
+}
+
+// ✅ Railway/Linux es case-sensitive: probamos variaciones comunes de nombres
+const utilsMod = safeRequire(['./src/utils', './src/Utils', './src/utils/index']);
+const botCoreMod = safeRequire(['./src/botCore', './src/botcore', './src/BotCore']);
+const panelMod  = safeRequire(['./src/panelTemplates', './src/paneltemplates', './src/PanelTemplates']);
+
+const { loadJSON, saveJSON, htmlEscape, applyTemplate } = utilsMod;
+const { createBot } = botCoreMod;
+const { qrDataUrl, layoutMobile, layoutDesktop } = panelMod;
 
 const qrDataUrlFn = async (qr) => (qr ? qrDataUrl(qr) : null);
 const BASE_DIR = __dirname;
@@ -15,7 +40,6 @@ const DATA_BASE = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : pa
 const AUTH_BASE = process.env.AUTH_DIR ? path.resolve(process.env.AUTH_DIR) : path.join(DATA_BASE, 'auth');
 
 const BOT_IDS = ['v1','v2','v3','v4','v5'];
-
 
 // ✅ garante estrutura de pastas/arquivos (Railway + Volume)
 function ensureBaseStorage() {
@@ -72,6 +96,23 @@ for (const botId of BOT_IDS) {
   });
 }
 
+// ------- QR automático al desconectar -------
+// Si querés desactivar este comportamiento, poné AUTO_NEW_QR_ON_DISCONNECT=false en .env
+const AUTO_NEW_QR_ON_DISCONNECT = String(process.env.AUTO_NEW_QR_ON_DISCONNECT ?? 'true').toLowerCase() === 'true';
+
+async function forceNewQr(botId) {
+  // 1) Corta conexión actual (si existe)
+  try { await bots[botId].disconnect(); } catch (e) {}
+
+  // 2) Borra credenciales: esto es lo que fuerza a WhatsApp/Baileys a emitir un QR NUEVO
+  const dir = path.join(AUTH_BASE, botId);
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
+
+  // 3) Reconecta: al no haber credenciales, debería aparecer QR
+  await bots[botId].connect();
+}
+
 // ------- users -------
 const USERS_FILE = path.join(DATA_BASE, 'users.json');
 function loadUsers(){ return loadJSON(USERS_FILE, {}); }
@@ -106,6 +147,17 @@ function getSelectedBotId(req){
   return 'v1';
 }
 
+// Helpers
+function normalizePhone(raw){
+  const digits = String(raw || '').replace(/\D/g,'');
+  if (!digits) return '';
+  return digits.startsWith('55') ? digits : ('55' + digits);
+}
+function jidToPhone(jid){
+  const j = String(jid || '').trim();
+  if (!j) return '';
+  return j.replace('@s.whatsapp.net','').replace(/\D/g,'');
+}
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -144,7 +196,19 @@ app.get('/api/status', requireAuth, async (req,res)=>{
 app.post('/api/toggle-connect', requireAuth, async (req,res)=>{
   const botId = getSelectedBotId({ user: req.user, query: { botId: req.body.botId } });
   const st = bots[botId].getStatus();
-  if (st.connected) await bots[botId].disconnect(); else await bots[botId].connect();
+
+  // ✅ Al "desconectar" desde el panel, forzamos un QR NUEVO automáticamente
+  // (borra authDir/<botId> y reconecta).
+  if (st.connected) {
+    if (AUTO_NEW_QR_ON_DISCONNECT) {
+      await forceNewQr(botId);
+    } else {
+      await bots[botId].disconnect();
+    }
+  } else {
+    await bots[botId].connect();
+  }
+
   res.json({ ok:true });
 });
 
@@ -217,9 +281,6 @@ app.post('/api/users/delete', requireAuth, (req,res)=>{
   saveUsers(users);
   res.json({ ok:true });
 });
-
-// ------- app -------
-
 
 // ------- auth -------
 app.get('/login', (req,res)=>{
@@ -347,16 +408,28 @@ app.post('/m/toggle-enabled', requireAuth, (req,res)=>{
   res.redirect(`/m${req.user.role==='admin'?`?botId=${botId}`:''}`);
 });
 
+/**
+ * ✅ FIX PERMANENTE:
+ * Agora aceita:
+ * - req.body.phone  (como no painel principal)
+ * - req.body.jid    (como no botão dentro do Lead)
+ */
 app.post('/m/action', requireAuth, (req,res)=>{
   const botId = getSelectedBotId(req);
   if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
   const bot = bots[botId];
 
-  const phoneRaw = (req.body.phone || '').replace(/\D/g,'');
-  if (!phoneRaw) return res.redirect(`/m${req.user.role==='admin'?`?botId=${botId}`:''}`);
-  const phone = phoneRaw.startsWith('55') ? phoneRaw : ('55'+phoneRaw);
-  const jid = phone + '@s.whatsapp.net';
+  // Pode vir phone OU jid
+  const jidFromBody = (req.body.jid || '').trim();
+  const phoneFromJid = normalizePhone(jidToPhone(jidFromBody));
 
+  const phoneRaw = (req.body.phone || '').replace(/\D/g,'');
+  const phoneFromPhone = normalizePhone(phoneRaw);
+
+  const phone = phoneFromJid || phoneFromPhone;
+  if (!phone) return res.redirect(`/m${req.user.role==='admin'?`?botId=${botId}`:''}`);
+
+  const jid = phone + '@s.whatsapp.net';
   const action = req.body.action;
   const reason = req.body.reason || '';
 
@@ -522,32 +595,45 @@ app.post('/m/agenda', requireAuth, async (req,res)=>{
   if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
   const bot = bots[botId];
 
-  const phoneKey = formatPhoneKey(req.body.phone);
-  const date = req.body.date;
-  const time = req.body.time;
+  try {
+    const phoneKey = formatPhoneKey(req.body.phone);
+    const date = req.body.date;
+    const time = req.body.time;
 
-  if (!phoneKey || !date || !time) return res.redirect(`/m/agenda${req.user.role==='admin'?`?botId=${botId}`:''}`);
+    if (!phoneKey || !date || !time) {
+      return res.redirect(`/m/agenda${req.user.role==='admin'?`?botId=${botId}`:''}`);
+    }
 
-  const apptTs = new Date(`${date}T${time}:00`).getTime();
-  const d = new Date(apptTs);
-  const data = {
-    DATA: `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`,
-    HORA: `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`,
-    VEICULO: req.body.vehicle || '',
-    PRODUTO: req.body.product || '',
-    VALOR: req.body.valor || '',
-    SINAL: req.body.sinal || '',
-    PAGAMENTO: req.body.pagamento || ''
-  };
+    const apptTs = new Date(`${date}T${time}:00`).getTime();
+    const d = new Date(apptTs);
+    const data = {
+      DATA: `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`,
+      HORA: `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`,
+      VEICULO: req.body.vehicle || '',
+      PRODUTO: req.body.product || '',
+      VALOR: req.body.valor || '',
+      SINAL: req.body.sinal || '',
+      PAGAMENTO: req.body.pagamento || ''
+    };
 
-  bot.scheduleAgendaFromPanel(phoneKey, date, time, data);
+    // salva/agenda
+    bot.scheduleAgendaFromPanel(phoneKey, date, time, data);
 
-  if (req.body.sendConfirm) {
-    await bot.sendConfirmNow(phoneKey, data);
+    // ⚠️ não bloqueia o request HTTP (Railway pode dar timeout/502)
+    if (req.body.sendConfirm) {
+      Promise.resolve(bot.sendConfirmNow(phoneKey, data))
+        .then((out)=>{
+          if (!out || !out.ok) console.warn('[AGENDA] confirm not sent:', out);
+        })
+        .catch((err)=> console.error('[AGENDA] confirm send error:', err));
+    }
+
+    appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'agenda_set', panelUser:req.user.username, phoneKey });
+    return res.redirect(`/m/agenda${req.user.role==='admin'?`?botId=${botId}`:''}`);
+  } catch (e) {
+    console.error('[AGENDA_POST] fail:', e?.stack || e);
+    return res.status(500).send('Erro ao salvar/enviar confirmação. Veja os logs do Railway e tente novamente.');
   }
-
-  appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'agenda_set', panelUser:req.user.username, phoneKey });
-  res.redirect(`/m/agenda${req.user.role==='admin'?`?botId=${botId}`:''}`);
 });
 
 app.post('/m/agenda/cancel', requireAuth, (req,res)=>{
@@ -639,16 +725,13 @@ app.post('/m/program/cancel', requireAuth, (req,res)=>{
   const snap = bot.getDataSnapshot();
   if (jid && snap.scheduledStarts && snap.scheduledStarts[jid]) {
     delete snap.scheduledStarts[jid];
-    const file = require('path').join(__dirname, 'data', botId, 'programados.json');
-    require('./src/utils').saveJSON(file, snap.scheduledStarts);
+    // ✅ FIX: salvar no DATA_BASE (Railway Volume), não em __dirname/data
+    const file = path.join(DATA_BASE, botId, 'programados.json');
+    saveJSON(file, snap.scheduledStarts);
   }
   appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'program_cancel', panelUser:req.user.username, jid });
   res.redirect(`/m/program${req.user.role==='admin'?`?botId=${botId}`:''}`);
 });
-
-
-
-
 
 // ------- cotizar -------
 app.get('/m/quote', requireAuth, (req,res)=>{
@@ -704,21 +787,32 @@ app.post('/m/quote', requireAuth, async (req,res)=>{
   if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
   const bot = bots[botId];
 
-  const phoneKey = String(req.body.phone||'').replace(/\D/g,'');
-  if (!phoneKey) return res.redirect(`/m/quote${req.user.role==='admin'?`?botId=${botId}`:''}`);
-  const pk = phoneKey.startsWith('55') ? phoneKey : ('55'+phoneKey);
+  try {
+    const phoneKey = String(req.body.phone||'').replace(/\D/g,'');
+    if (!phoneKey) return res.redirect(`/m/quote${req.user.role==='admin'?`?botId=${botId}`:''}`);
+    const pk = phoneKey.startsWith('55') ? phoneKey : ('55'+phoneKey);
 
-  const payload = {
-    productKey: req.body.productKey || 'ironGlassPlus',
-    vehicle: req.body.vehicle || '',
-    year: Number(req.body.year||'') || '',
-    value: req.body.value || '',
-    payment: req.body.payment || ''
-  };
+    const payload = {
+      productKey: req.body.productKey || 'ironGlassPlus',
+      vehicle: req.body.vehicle || '',
+      year: Number(req.body.year||'') || '',
+      value: req.body.value || '',
+      payment: req.body.payment || ''
+    };
 
-  const out = await bot.sendQuoteNow(pk, payload);
-  appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'quote_sent', panelUser:req.user.username, phoneKey: pk, payload });
-  res.redirect(`/m/leads${req.user.role==='admin'?`?botId=${botId}`:''}`);
+    // não bloqueia o request (evita timeout/502)
+    Promise.resolve(bot.sendQuoteNow(pk, payload))
+      .then((out)=>{
+        if (!out || !out.ok) console.warn('[QUOTE] not sent:', out);
+      })
+      .catch((err)=> console.error('[QUOTE] send error:', err));
+
+    appendEvent({ botId, ts: Date.now(), iso: new Date().toISOString(), action:'quote_sent', panelUser:req.user.username, phoneKey: pk, payload });
+    return res.redirect(`/m/leads${req.user.role==='admin'?`?botId=${botId}`:''}`);
+  } catch (e) {
+    console.error('[QUOTE_POST] fail:', e?.stack || e);
+    return res.status(500).send('Erro ao enviar cotação. Veja os logs do Railway e tente novamente.');
+  }
 });
 
 app.post('/m/quote/templates', requireAuth, (req,res)=>{
@@ -835,7 +929,15 @@ app.get('/m/lead', requireAuth, (req,res)=>{
       <div style="font-weight:800;margin-bottom:6px">Ações rápidas</div>
       <form method="POST" action="/m/action${req.user.role==='admin'?`?botId=${botId}`:''}">
         <input type="hidden" name="jid" value="${htmlEscape(jid)}"/>
-        <button class="btn" name="action" value="markClient" type="submit" style="width:100%">Marcar como cliente (pós-venda)</button>
+        <select name="action" style="width:100%;margin-bottom:10px">
+          <option value="markClient">Marcar como cliente (pós-venda)</option>
+          <option value="pause72">Pausar 72h</option>
+          <option value="remove">Sacar do funil</option>
+          <option value="botOff24">Bot OFF 24h</option>
+          <option value="block">Bloquear definitivo</option>
+        </select>
+        <input name="reason" placeholder="Motivo (opcional)" style="width:100%;margin-bottom:10px" />
+        <button class="btn btn-primary" type="submit" style="width:100%">Executar ação</button>
       </form>
     </div>
   `;
@@ -898,7 +1000,6 @@ app.get('/m/dashboard', requireAuth, (req,res)=>{
   `;
   res.send(layoutMobile({ title:'Dashboard', user:req.user, bodyHtml: body }));
 });
-
 
 // ------- commands -------
 app.get('/m/commands', requireAuth, (req,res)=>{
@@ -1018,7 +1119,6 @@ app.get('/m/stats', requireAuth, (req,res)=>{
     .filter(e => req.user.role === 'admin' ? (botId ? e.botId === botId : true) : e.botId === botId)
     .filter(e => inRange(Number(e.ts||0), fromTs, toTs));
 
-  
   const rulesK = bots[botId].getConfig()?.rules || { minYearFollowUp: 2022 };
   const minYearK = Number(rulesK.minYearFollowUp || 2022);
   const leadsK = bots[botId].getLeads();
@@ -1031,7 +1131,7 @@ app.get('/m/stats', requireAuth, (req,res)=>{
   const eventsK = loadJSON(EVENTS_FILE, []);
   const sentK = eventsK.filter(e=>e.botId=== botId && e.action==='auto_sent').length;
 
-const byYear = {};
+  const byYear = {};
   const byModel = {};
   for (const e of rows) {
     const y = e.year || 'SEM_ANO';
@@ -1084,7 +1184,6 @@ const byYear = {};
   `;
   res.send(layoutMobile({ title:'Estatísticas', user:req.user, bodyHtml: body }));
 });
-
 
 app.get('/m/users', requireAuth, (req,res)=>{
   if (req.user.role !== 'admin') return res.status(403).send('forbidden');
