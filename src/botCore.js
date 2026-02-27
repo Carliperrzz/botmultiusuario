@@ -113,7 +113,6 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     counters: loadJSON(FILES.counters, defaults.counters),
   };
 
-  // merge safe
   data.config = { ...defaults.config, ...(data.config || {}) };
   data.config.window = { ...defaults.config.window, ...(data.config.window || {}) };
   data.config.limits = { ...defaults.config.limits, ...(data.config.limits || {}) };
@@ -139,11 +138,11 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   }
   persistAll();
 
-  // ===== Silent mode (reduce sync / notifications impact) =====
+  // ===== Silent mode =====
   const SILENT_MODE = String(process.env.SILENT_MODE ?? 'true').toLowerCase() === 'true';
   const MARK_ONLINE = String(process.env.MARK_ONLINE_ON_CONNECT ?? 'false').toLowerCase() === 'true';
-  const READ_INBOUND_MESSAGES = String(process.env.READ_INBOUND_MESSAGES ?? 'false').toLowerCase() === 'true'; // default false
-  const SEND_PRESENCE_UPDATES = String(process.env.SEND_PRESENCE_UPDATES ?? 'false').toLowerCase() === 'true'; // default false
+  const READ_INBOUND_MESSAGES = String(process.env.READ_INBOUND_MESSAGES ?? 'false').toLowerCase() === 'true';
+  const SEND_PRESENCE_UPDATES = String(process.env.SEND_PRESENCE_UPDATES ?? 'false').toLowerCase() === 'true';
 
   let sock = null;
   let connecting = false;
@@ -152,7 +151,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
 
   let state = {
     connected: false,
-    enabled: true, // controla funil/envíos, NO conexión WA
+    enabled: true, // controla funil/envíos, no conexión
     qr: null,
     queueSize: 0,
     lastError: null,
@@ -197,7 +196,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
         name: '',
         model: '',
         year: null,
-        dedupe: {}, // { step0: ts, ... }
+        dedupe: {},
       };
       saveJSON(FILES.leads, data.leads);
     }
@@ -213,7 +212,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   function saveQuotes() { saveJSON(FILES.quotes, data.quotesConfig); }
   function saveCounters() { saveJSON(FILES.counters, data.counters); }
 
-  // ===== queue / anti parallel sending =====
+  // ===== queue / anti-parallel =====
   let sendQueue = Promise.resolve();
   let queueCount = 0;
 
@@ -221,15 +220,14 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     queueCount += 1;
     setState({ queueSize: queueCount });
 
-    sendQueue = sendQueue
-      .then(async () => {
-        try { return await task(); }
-        finally {
-          queueCount = Math.max(0, queueCount - 1);
-          setState({ queueSize: queueCount });
-        }
-      })
-      .catch(() => {});
+    sendQueue = sendQueue.then(async () => {
+      try {
+        return await task();
+      } finally {
+        queueCount = Math.max(0, queueCount - 1);
+        setState({ queueSize: queueCount });
+      }
+    }).catch(() => {});
 
     return sendQueue;
   }
@@ -266,7 +264,6 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   function canSendNow(jid) {
     pruneCounters();
 
-    // ventana horaria São Paulo
     if (!isWithinWindow(data.config.window || {})) {
       return { ok: false, reason: 'outside_window' };
     }
@@ -314,8 +311,8 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     const precheck = canSendNow(jid);
     if (!precheck.ok) return { ok: false, error: precheck.reason };
 
-    const minDelay = Number(process.env.MIN_DELAY_MS || 1200);
-    const maxDelay = Number(process.env.MAX_DELAY_MS || 2800);
+    const minDelay = Number(process.env.MIN_DELAY_MS || 1500);
+    const maxDelay = Number(process.env.MAX_DELAY_MS || 3000);
 
     return enqueue(async () => {
       const check = canSendNow(jid);
@@ -357,13 +354,8 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
 
   function scheduleNextByStep(lead) {
     const idx = Number(lead.stepIndex || 0);
-    const delays = [
-      0,
-      24 * 60 * 60 * 1000,
-      48 * 60 * 60 * 1000,
-      72 * 60 * 60 * 1000,
-    ];
-    lead.nextAt = Date.now() + (delays[idx] ?? (24 * 60 * 60 * 1000));
+    const delays = [0, 24*60*60*1000, 48*60*60*1000, 72*60*60*1000];
+    lead.nextAt = Date.now() + (delays[idx] ?? (24*60*60*1000));
     lead.updatedAt = nowTs();
   }
 
@@ -371,11 +363,8 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     const key = stepKeys()[stepIdx];
     if (!key) return { ok: false, error: 'step_end' };
 
-    // dedupe 10 min por step
-    const lastSentStepTs = Number(lead.dedupe?.[key] || 0);
-    if (Date.now() - lastSentStepTs < 10 * 60 * 1000) {
-      return { ok: false, error: 'dedupe' };
-    }
+    const lastTs = Number(lead.dedupe?.[key] || 0);
+    if (Date.now() - lastTs < 10 * 60 * 1000) return { ok: false, error: 'dedupe' };
 
     const txt = data.messagesConfig[key];
     if (!txt || !String(txt).trim()) return { ok: false, error: 'empty_message' };
@@ -395,7 +384,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
 
   async function processScheduledStarts(now) {
     for (const [jid, item] of Object.entries(data.scheduledStarts || {})) {
-      if (!item || !item.at) continue;
+      if (!item?.at) continue;
       if (now < Number(item.at)) continue;
 
       const lead = getLead(jid);
@@ -410,7 +399,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
       const out = await sendTextSafe(jid, text, { step: 'program_start' });
       if (out.ok) {
         lead.stage = 'programado';
-        lead.stepIndex = 1; // ya mandó primer toque
+        lead.stepIndex = 1; // ya mandó el primer mensaje programado
         lead.nextAt = now + 24 * 60 * 60 * 1000;
         lead.updatedAt = nowTs();
         lead.dedupe = lead.dedupe || {};
@@ -431,7 +420,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
 
       const nextArr = [];
       for (const ag of arr) {
-        if (!ag || !ag.at) continue;
+        if (!ag?.at) continue;
         if (ag.sent) { nextArr.push(ag); continue; }
 
         if (now >= Number(ag.at)) {
@@ -454,7 +443,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   }
 
   async function processFollowUps(now) {
-    if (!state.enabled) return; // Funil OFF => no envíos automáticos, pero conexión sigue normal
+    if (!state.enabled) return;
 
     for (const lead of Object.values(data.leads || {})) {
       if (!lead?.jid) continue;
@@ -462,7 +451,8 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
       if (lead.isClient) continue;
       if (lead.pausedUntil && now < Number(lead.pausedUntil)) continue;
       if (lead.manualOffUntil && now < Number(lead.manualOffUntil)) continue;
-      if (lead.nextAt && now < Number(lead.nextAt)) continue;
+      if (!lead.nextAt) continue; // ✅ NO inicia automático si no fue programado
+      if (now < Number(lead.nextAt)) continue;
 
       const minYear = Number(data.config.rules?.minYearFollowUp || 2022);
       if (lead.year && Number(lead.year) < minYear) continue;
@@ -514,7 +504,6 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
           keys: makeCacheableSignalKeyStore(authState.keys, P({ level: 'silent' })),
         },
         browser: ['Iron Glass', 'Chrome', '1.0.0'],
-        // SILENT MODE: no “online” visible
         markOnlineOnConnect: SILENT_MODE ? false : MARK_ONLINE,
         generateHighQualityLinkPreview: false,
       });
@@ -532,7 +521,6 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
         if (connection === 'open') {
           setState({ connected: true, qr: null, lastError: null });
           ev('wa_open', {});
-          // no presence on open if silent
         }
 
         if (connection === 'close') {
@@ -540,10 +528,8 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
           const code = lastDisconnect?.error?.output?.statusCode;
           ev('wa_close', { code });
 
-          // si fue desconexión manual del panel, no auto-reconectar acá
           if (manualDisconnect) return;
 
-          // si no fue logout, reconexión simple
           if (code !== DisconnectReason.loggedOut) {
             setTimeout(() => connect().catch(() => {}), 2500);
           }
@@ -570,28 +556,24 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
           const lead = getLead(jid);
 
           if (!fromMe) {
-            // IMPORTANT: no marcar leído para no comerse notificaciones en el celular
+            // ✅ NO marcar leído (para no perder notificaciones en el celular)
             if (READ_INBOUND_MESSAGES && !SILENT_MODE) {
-              try {
-                await sock.readMessages?.([msg.key]);
-              } catch (_) {}
+              try { await sock.readMessages?.([msg.key]); } catch (_) {}
             }
 
             lead.lastInboundAt = nowTs();
             lead.updatedAt = nowTs();
 
-            // parse básico año/modelo
             const parsed = parseCarInfo(text);
             if (parsed.year && !lead.year) lead.year = parsed.year;
             if (parsed.model && (!lead.model || parsed.model.length > String(lead.model || '').length)) {
               lead.model = parsed.model;
             }
 
-            // si nuevo lead, programar step0
-            if (!lead.stepIndex && !lead.nextAt) {
-              lead.stepIndex = 0;
-              lead.nextAt = Date.now();
-            }
+            // ✅ NO iniciar funil automático por inbound
+            // Solo registrar lead. El inicio se hace por Programar / agenda / acción manual.
+            if (lead.stepIndex == null) lead.stepIndex = 0;
+            if (!lead.nextAt) lead.nextAt = 0;
 
             data.leads[jid] = lead;
             saveLeads();
@@ -604,7 +586,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
               year: lead.year || null,
             });
           } else {
-            // comandos manuales (enviados por el vendedor)
+            // comandos manuales del vendedor
             const c = data.config.commands || {};
             const txt = String(text || '').trim().toUpperCase();
 
@@ -638,21 +620,10 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   }
 
   // ===== Métodos usados por server.js =====
-  function getStatus() {
-    return { ...state };
-  }
-
-  function setEnabled(v) {
-    setState({ enabled: !!v });
-  }
-
-  function getConfig() {
-    return JSON.parse(JSON.stringify(data.config));
-  }
-
-  function getLeads() {
-    return data.leads || {};
-  }
+  function getStatus() { return { ...state }; }
+  function setEnabled(v) { setState({ enabled: !!v }); }
+  function getConfig() { return JSON.parse(JSON.stringify(data.config)); }
+  function getLeads() { return data.leads || {}; }
 
   function getDataSnapshot() {
     return {
@@ -857,24 +828,20 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   }
 
   return {
-    // WA
     connect,
     disconnect,
 
-    // panel/state
     getStatus,
     setEnabled,
     getConfig,
     getLeads,
     getDataSnapshot,
 
-    // settings
     updateMessages,
     updateConfig,
     setCommands,
     updateQuotes,
 
-    // lead actions
     updateLead,
     pauseFollowUp,
     stopFollowUp,
@@ -882,7 +849,6 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     blockFollowUp,
     markAsClient,
 
-    // agenda / program / quote
     scheduleAgendaFromPanel,
     sendConfirmNow,
     cancelAgenda,
