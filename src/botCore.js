@@ -25,7 +25,8 @@ const {
 } = require('./utils');
 
 function createBot({ botId, baseDir, authDir, eventLogger }) {
-  const botDir = path.join(process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(baseDir, 'data'), botId);
+  const dataBase = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(baseDir, 'data');
+  const botDir = path.join(dataBase, botId);
   ensureDir(botDir);
   ensureDir(authDir);
 
@@ -47,10 +48,10 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
       rules: { minYearFollowUp: 2022 },
       commands: { stop: 'STOP', pause: 'PAUSE', client: 'CLIENTE', remove: 'REMOVE', botOff: 'BOT OFF' },
     },
-    messages: {
+    messagesConfig: {
       step0: 'Oi! Carlos por aqui 😊 Tudo certo? Você ainda quer proteger os vidros do seu carro?',
-      step1: 'Passando para saber se posso te ajudar com alguma dúvida sobre o blindagem dos vidros 😊',
-      step2: 'Se quiser, eu posso te enviar uma cotização sem compromisso 👍',
+      step1: 'Passando para saber se posso te ajudar com alguma dúvida sobre a proteção dos vidros 😊',
+      step2: 'Se quiser, posso te enviar uma cotização sem compromisso 👍',
       step3: 'Última mensagem por aqui 😊 Se ainda tiver interesse, me chama que te atendo com prazer.',
       extra: '',
       postSale30: 'Oi! Tudo bem? Passando só para saber como está a experiência com a Iron Glass 😊',
@@ -58,77 +59,73 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
       agenda1: 'Olá! Faltam 3 dias para seu agendamento na Iron Glass.',
       agenda2: 'Olá! Seu agendamento é amanhã. Qualquer dúvida me chama 😊',
       confirmTemplate:
-        '✅ *Agendamento confirmado*\\n' +
-        '📅 Data: {{DATA}}\\n' +
-        '🕒 Hora: {{HORA}}\\n' +
-        '🚗 Veículo: {{VEICULO}}\\n' +
-        '🛡️ Produto: {{PRODUTO}}\\n' +
-        '💰 Valor: {{VALOR}}\\n' +
+        '✅ *Agendamento confirmado*\n' +
+        '📅 Data: {{DATA}}\n' +
+        '🕒 Hora: {{HORA}}\n' +
+        '🚗 Veículo: {{VEICULO}}\n' +
+        '🛡️ Produto: {{PRODUTO}}\n' +
+        '💰 Valor: {{VALOR}}\n' +
         '💳 Pagamento: {{PAGAMENTO}}',
     },
-    quotes: {
+    quotesConfig: {
       ironGlass: {
-        title: 'Cotização Iron Glass',
         template:
-          '🛡️ *Cotização Iron Glass*\\n' +
-          '🚗 Veículo: {{VEICULO}} {{ANO}}\\n' +
-          '💰 Valor: {{VALOR}}\\n' +
+          '🛡️ *Cotização Iron Glass*\n' +
+          '🚗 Veículo: {{VEICULO}} {{ANO}}\n' +
+          '💰 Valor: {{VALOR}}\n' +
           '💳 Pagamento: {{PAGAMENTO}}',
       },
       ironGlassPlus: {
-        title: 'Cotização Iron Glass Plus',
         template:
-          '🛡️ *Cotização Iron Glass Plus*\\n' +
-          '🚗 Veículo: {{VEICULO}} {{ANO}}\\n' +
-          '💰 Valor: {{VALOR}}\\n' +
+          '🛡️ *Cotização Iron Glass Plus*\n' +
+          '🚗 Veículo: {{VEICULO}} {{ANO}}\n' +
+          '💰 Valor: {{VALOR}}\n' +
           '💳 Pagamento: {{PAGAMENTO}}',
       },
       defender: {
-        title: 'Cotização Defender',
         template:
-          '🛡️ *Cotização Defender*\\n' +
-          '🚗 Veículo: {{VEICULO}} {{ANO}}\\n' +
-          '💰 Valor: {{VALOR}}\\n' +
+          '🛡️ *Cotização Defender*\n' +
+          '🚗 Veículo: {{VEICULO}} {{ANO}}\n' +
+          '💰 Valor: {{VALOR}}\n' +
           '💳 Pagamento: {{PAGAMENTO}}',
       },
     },
-  };
-
-  let sock = null;
-  let connecting = false;
-  let state = {
-    connected: false,
-    enabled: true,
-    qr: null,
-    queueSize: 0,
-    lastError: null,
-    lastUpdate: new Date().toISOString(),
-  };
-
-  let data = {
-    config: loadJSON(FILES.config, defaults.config),
-    messagesConfig: loadJSON(FILES.messages, defaults.messages),
-    leads: loadJSON(FILES.leads, {}),
-    blocked: loadJSON(FILES.blocked, {}),
-    scheduledStarts: loadJSON(FILES.scheduled, {}),
-    agendas: loadJSON(FILES.agendas, {}),
-    quotesConfig: loadJSON(FILES.quotes, defaults.quotes),
-    counters: loadJSON(FILES.counters, {
+    blocked: {},
+    leads: {},
+    scheduledStarts: {},
+    agendas: {},
+    counters: {
       byMinute: {},
       byHour: {},
       byDay: {},
       byContactDay: {},
-    }),
+    },
   };
 
-  // merge defaults sin pisar
+  let data = {
+    config: loadJSON(FILES.config, defaults.config),
+    messagesConfig: loadJSON(FILES.messages, defaults.messagesConfig),
+    leads: loadJSON(FILES.leads, defaults.leads),
+    blocked: loadJSON(FILES.blocked, defaults.blocked),
+    scheduledStarts: loadJSON(FILES.scheduled, defaults.scheduledStarts),
+    agendas: loadJSON(FILES.agendas, defaults.agendas),
+    quotesConfig: loadJSON(FILES.quotes, defaults.quotesConfig),
+    counters: loadJSON(FILES.counters, defaults.counters),
+  };
+
+  // merge safe
   data.config = { ...defaults.config, ...(data.config || {}) };
   data.config.window = { ...defaults.config.window, ...(data.config.window || {}) };
   data.config.limits = { ...defaults.config.limits, ...(data.config.limits || {}) };
   data.config.rules = { ...defaults.config.rules, ...(data.config.rules || {}) };
   data.config.commands = { ...defaults.config.commands, ...(data.config.commands || {}) };
-  data.messagesConfig = { ...defaults.messages, ...(data.messagesConfig || {}) };
-  data.quotesConfig = { ...defaults.quotes, ...(data.quotesConfig || {}) };
+  data.messagesConfig = { ...defaults.messagesConfig, ...(data.messagesConfig || {}) };
+  data.quotesConfig = { ...defaults.quotesConfig, ...(data.quotesConfig || {}) };
+  data.counters = { ...defaults.counters, ...(data.counters || {}) };
+  data.counters.byMinute = data.counters.byMinute || {};
+  data.counters.byHour = data.counters.byHour || {};
+  data.counters.byDay = data.counters.byDay || {};
+  data.counters.byContactDay = data.counters.byContactDay || {};
 
   function persistAll() {
     saveJSON(FILES.config, data.config);
@@ -141,6 +138,26 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     saveJSON(FILES.counters, data.counters);
   }
   persistAll();
+
+  // ===== Silent mode (reduce sync / notifications impact) =====
+  const SILENT_MODE = String(process.env.SILENT_MODE ?? 'true').toLowerCase() === 'true';
+  const MARK_ONLINE = String(process.env.MARK_ONLINE_ON_CONNECT ?? 'false').toLowerCase() === 'true';
+  const READ_INBOUND_MESSAGES = String(process.env.READ_INBOUND_MESSAGES ?? 'false').toLowerCase() === 'true'; // default false
+  const SEND_PRESENCE_UPDATES = String(process.env.SEND_PRESENCE_UPDATES ?? 'false').toLowerCase() === 'true'; // default false
+
+  let sock = null;
+  let connecting = false;
+  let schedulerHandle = null;
+  let manualDisconnect = false;
+
+  let state = {
+    connected: false,
+    enabled: true, // controla funil/envíos, NO conexión WA
+    qr: null,
+    queueSize: 0,
+    lastError: null,
+    lastUpdate: new Date().toISOString(),
+  };
 
   function setState(patch) {
     state = { ...state, ...patch, lastUpdate: new Date().toISOString() };
@@ -180,7 +197,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
         name: '',
         model: '',
         year: null,
-        dedupe: {}, // stepKey -> ts
+        dedupe: {}, // { step0: ts, ... }
       };
       saveJSON(FILES.leads, data.leads);
     }
@@ -196,13 +213,14 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   function saveQuotes() { saveJSON(FILES.quotes, data.quotesConfig); }
   function saveCounters() { saveJSON(FILES.counters, data.counters); }
 
-  // ---------- rate limit / queue ----------
+  // ===== queue / anti parallel sending =====
   let sendQueue = Promise.resolve();
   let queueCount = 0;
 
   function enqueue(task) {
     queueCount += 1;
     setState({ queueSize: queueCount });
+
     sendQueue = sendQueue
       .then(async () => {
         try { return await task(); }
@@ -212,6 +230,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
         }
       })
       .catch(() => {});
+
     return sendQueue;
   }
 
@@ -229,25 +248,30 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   }
 
   function pruneCounters() {
-    // limpieza simple para que no crezca
-    const minuteKeep = new Set([keyMinute(), keyMinute(Date.now()-60000), keyMinute(Date.now()-120000)]);
-    for (const k of Object.keys(data.counters.byMinute || {})) if (!minuteKeep.has(k)) delete data.counters.byMinute[k];
+    const keepM = new Set([keyMinute(), keyMinute(Date.now()-60000), keyMinute(Date.now()-120000)]);
+    for (const k of Object.keys(data.counters.byMinute)) if (!keepM.has(k)) delete data.counters.byMinute[k];
 
-    const hourKeep = new Set([keyHour(), keyHour(Date.now()-3600000)]);
-    for (const k of Object.keys(data.counters.byHour || {})) if (!hourKeep.has(k)) delete data.counters.byHour[k];
+    const keepH = new Set([keyHour(), keyHour(Date.now()-3600000)]);
+    for (const k of Object.keys(data.counters.byHour)) if (!keepH.has(k)) delete data.counters.byHour[k];
 
-    const dayKeep = new Set([keyDay(), keyDay(Date.now()-86400000)]);
-    for (const k of Object.keys(data.counters.byDay || {})) if (!dayKeep.has(k)) delete data.counters.byDay[k];
+    const keepD = new Set([keyDay(), keyDay(Date.now()-86400000)]);
+    for (const k of Object.keys(data.counters.byDay)) if (!keepD.has(k)) delete data.counters.byDay[k];
 
-    for (const k of Object.keys(data.counters.byContactDay || {})) {
+    for (const k of Object.keys(data.counters.byContactDay)) {
       const day = k.split('|')[0];
-      if (!dayKeep.has(day)) delete data.counters.byContactDay[k];
+      if (!keepD.has(day)) delete data.counters.byContactDay[k];
     }
   }
 
   function canSendNow(jid) {
     pruneCounters();
-    const limits = data.config.limits || defaults.config.limits;
+
+    // ventana horaria São Paulo
+    if (!isWithinWindow(data.config.window || {})) {
+      return { ok: false, reason: 'outside_window' };
+    }
+
+    const limits = data.config.limits || {};
     const ts = Date.now();
     const km = keyMinute(ts), kh = keyHour(ts), kd = keyDay(ts);
     const kcd = `${kd}|${jid}`;
@@ -261,7 +285,6 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     if (perHour >= Number(limits.perHour || 120)) return { ok: false, reason: 'limit_hour' };
     if (perDay >= Number(limits.perDay || 400)) return { ok: false, reason: 'limit_day' };
     if (perContactDay >= Number(limits.perContactPerDay || 2)) return { ok: false, reason: 'limit_contact_day' };
-    if (!isWithinWindow(data.config.window || {})) return { ok: false, reason: 'outside_window' };
 
     return { ok: true };
   }
@@ -270,6 +293,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     const ts = Date.now();
     const km = keyMinute(ts), kh = keyHour(ts), kd = keyDay(ts);
     const kcd = `${kd}|${jid}`;
+
     data.counters.byMinute[km] = (data.counters.byMinute[km] || 0) + 1;
     data.counters.byHour[kh] = (data.counters.byHour[kh] || 0) + 1;
     data.counters.byDay[kd] = (data.counters.byDay[kd] || 0) + 1;
@@ -277,24 +301,33 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     saveCounters();
   }
 
+  async function maybePresence(jid, type) {
+    if (SILENT_MODE) return;
+    if (!SEND_PRESENCE_UPDATES) return;
+    try { await sock?.sendPresenceUpdate?.(type, jid); } catch (_) {}
+  }
+
   async function sendTextSafe(jid, text, meta = {}) {
     if (!sock || !state.connected) return { ok: false, error: 'not_connected' };
-    const lead = getLead(jid);
 
-    const check = canSendNow(jid);
-    if (!check.ok) return { ok: false, error: check.reason };
+    const lead = getLead(jid);
+    const precheck = canSendNow(jid);
+    if (!precheck.ok) return { ok: false, error: precheck.reason };
 
     const minDelay = Number(process.env.MIN_DELAY_MS || 1200);
     const maxDelay = Number(process.env.MAX_DELAY_MS || 2800);
 
     return enqueue(async () => {
-      const again = canSendNow(jid);
-      if (!again.ok) return { ok: false, error: again.reason };
+      const check = canSendNow(jid);
+      if (!check.ok) return { ok: false, error: check.reason };
 
       await sleep(randomInt(minDelay, maxDelay));
+      await maybePresence(jid, 'composing');
 
       try {
         await sock.sendMessage(jid, { text: String(text || '') });
+        await maybePresence(jid, 'paused');
+
         markSendCounter(jid);
 
         lead.lastOutboundAt = nowTs();
@@ -317,21 +350,20 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     });
   }
 
-  // ---------- funil ----------
+  // ===== Funil =====
   function stepKeys() {
     return ['step0', 'step1', 'step2', 'step3'];
   }
 
   function scheduleNextByStep(lead) {
-    // delays entre pasos (ajustables si querés luego por config)
-    const delays = [
-      0,                      // step0 puede ir inmediato cuando entra
-      24 * 60 * 60 * 1000,    // step1: 24h
-      48 * 60 * 60 * 1000,    // step2: 48h
-      72 * 60 * 60 * 1000,    // step3: 72h
-    ];
     const idx = Number(lead.stepIndex || 0);
-    lead.nextAt = Date.now() + (delays[idx] || (24 * 60 * 60 * 1000));
+    const delays = [
+      0,
+      24 * 60 * 60 * 1000,
+      48 * 60 * 60 * 1000,
+      72 * 60 * 60 * 1000,
+    ];
+    lead.nextAt = Date.now() + (delays[idx] ?? (24 * 60 * 60 * 1000));
     lead.updatedAt = nowTs();
   }
 
@@ -339,9 +371,9 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     const key = stepKeys()[stepIdx];
     if (!key) return { ok: false, error: 'step_end' };
 
-    // dedupe: no mandar mismo step < 10 min
-    const dedupeTs = Number(lead.dedupe?.[key] || 0);
-    if (Date.now() - dedupeTs < 10 * 60 * 1000) {
+    // dedupe 10 min por step
+    const lastSentStepTs = Number(lead.dedupe?.[key] || 0);
+    if (Date.now() - lastSentStepTs < 10 * 60 * 1000) {
       return { ok: false, error: 'dedupe' };
     }
 
@@ -353,7 +385,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
       lead.dedupe = lead.dedupe || {};
       lead.dedupe[key] = Date.now();
       lead.stepIndex = stepIdx + 1;
-      lead.stage = (lead.stage === 'novo' ? 'em_negociacao' : lead.stage);
+      if (lead.stage === 'novo') lead.stage = 'em_negociacao';
       scheduleNextByStep(lead);
       data.leads[lead.jid] = lead;
       saveLeads();
@@ -361,17 +393,16 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     return out;
   }
 
-  async function schedulerTick() {
-    if (!state.enabled) return;
-    const now = Date.now();
-
-    // 1) mensagens programadas (programados)
+  async function processScheduledStarts(now) {
     for (const [jid, item] of Object.entries(data.scheduledStarts || {})) {
       if (!item || !item.at) continue;
       if (now < Number(item.at)) continue;
 
       const lead = getLead(jid);
-      if (lead.blocked) { delete data.scheduledStarts[jid]; continue; }
+      if (lead.blocked) {
+        delete data.scheduledStarts[jid];
+        continue;
+      }
 
       let text = String(item.text || '').trim();
       if (!text) text = data.messagesConfig.step0 || '';
@@ -379,25 +410,29 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
       const out = await sendTextSafe(jid, text, { step: 'program_start' });
       if (out.ok) {
         lead.stage = 'programado';
-        lead.stepIndex = 1; // já mandou o primeiro toque
+        lead.stepIndex = 1; // ya mandó primer toque
         lead.nextAt = now + 24 * 60 * 60 * 1000;
         lead.updatedAt = nowTs();
         lead.dedupe = lead.dedupe || {};
         lead.dedupe.step0 = now;
         data.leads[jid] = lead;
+
         delete data.scheduledStarts[jid];
         saveLeads();
         saveScheduled();
       }
     }
+  }
 
-    // 2) agendas (lembretes)
+  async function processAgendas(now) {
+    let changed = false;
     for (const [jid, arr] of Object.entries(data.agendas || {})) {
       if (!Array.isArray(arr) || !arr.length) continue;
-      const pending = [];
+
+      const nextArr = [];
       for (const ag of arr) {
         if (!ag || !ag.at) continue;
-        if (ag.sent) { pending.push(ag); continue; }
+        if (ag.sent) { nextArr.push(ag); continue; }
 
         if (now >= Number(ag.at)) {
           const msgKey = ag.key || 'agenda0';
@@ -407,53 +442,66 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
           if (out.ok) {
             ag.sent = true;
             ag.sentAt = nowTs();
+            changed = true;
           }
         }
-        pending.push(ag);
+        nextArr.push(ag);
       }
-      data.agendas[jid] = pending.filter(x => !x.sent || (Date.now() - Number(x.at || 0) < 7 * 24 * 60 * 60 * 1000));
-    }
-    saveAgendas();
 
-    // 3) funil normal
+      data.agendas[jid] = nextArr.filter(x => !x.sent || (Date.now() - Number(x.at || 0) < 7 * 24 * 60 * 60 * 1000));
+    }
+    if (changed) saveAgendas();
+  }
+
+  async function processFollowUps(now) {
+    if (!state.enabled) return; // Funil OFF => no envíos automáticos, pero conexión sigue normal
+
     for (const lead of Object.values(data.leads || {})) {
-      if (!lead || !lead.jid) continue;
+      if (!lead?.jid) continue;
       if (lead.blocked) continue;
       if (lead.isClient) continue;
       if (lead.pausedUntil && now < Number(lead.pausedUntil)) continue;
       if (lead.manualOffUntil && now < Number(lead.manualOffUntil)) continue;
       if (lead.nextAt && now < Number(lead.nextAt)) continue;
 
-      // regra por ano
       const minYear = Number(data.config.rules?.minYearFollowUp || 2022);
-      if (lead.year && Number(lead.year) < minYear) {
-        // registra inbound/stat, mas no funil não entra
-        continue;
-      }
+      if (lead.year && Number(lead.year) < minYear) continue;
 
       const stepIdx = Number(lead.stepIndex || 0);
       if (stepIdx >= stepKeys().length) continue;
 
       await trySendStep(lead, stepIdx);
     }
+  }
 
+  async function schedulerTick() {
+    const now = Date.now();
+    await processScheduledStarts(now);
+    await processAgendas(now);
+    await processFollowUps(now);
     saveLeads();
   }
 
-  let schedulerHandle = setInterval(() => {
-    schedulerTick().catch((e) => setState({ lastError: String(e?.message || e) }));
-  }, 5000);
+  function startScheduler() {
+    if (schedulerHandle) clearInterval(schedulerHandle);
+    schedulerHandle = setInterval(() => {
+      schedulerTick().catch((e) => setState({ lastError: String(e?.message || e) }));
+    }, 5000);
+  }
+  startScheduler();
 
-  // ---------- WhatsApp / Baileys ----------
+  // ===== WhatsApp / Baileys =====
   async function connect() {
     if (connecting) return;
     if (sock && state.connected) return;
 
     connecting = true;
+    manualDisconnect = false;
     setState({ lastError: null });
 
     try {
       ensureDir(authDir);
+
       const { state: authState, saveCreds } = await useMultiFileAuthState(authDir);
       const { version } = await fetchLatestBaileysVersion();
 
@@ -466,7 +514,9 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
           keys: makeCacheableSignalKeyStore(authState.keys, P({ level: 'silent' })),
         },
         browser: ['Iron Glass', 'Chrome', '1.0.0'],
-        markOnlineOnConnect: false,
+        // SILENT MODE: no “online” visible
+        markOnlineOnConnect: SILENT_MODE ? false : MARK_ONLINE,
+        generateHighQualityLinkPreview: false,
       });
 
       sock.ev.on('creds.update', saveCreds);
@@ -474,11 +524,15 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
       sock.ev.on('connection.update', (u) => {
         const { connection, qr, lastDisconnect } = u;
 
-        if (qr) setState({ qr, connected: false });
+        if (qr) {
+          setState({ qr, connected: false });
+          ev('wa_qr', {});
+        }
 
         if (connection === 'open') {
           setState({ connected: true, qr: null, lastError: null });
           ev('wa_open', {});
+          // no presence on open if silent
         }
 
         if (connection === 'close') {
@@ -486,18 +540,19 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
           const code = lastDisconnect?.error?.output?.statusCode;
           ev('wa_close', { code });
 
-          // Nota: el server.js ya maneja reset QR al desconectar manualmente.
-          // Acá hacemos reconexión simple si no fue logout explícito.
+          // si fue desconexión manual del panel, no auto-reconectar acá
+          if (manualDisconnect) return;
+
+          // si no fue logout, reconexión simple
           if (code !== DisconnectReason.loggedOut) {
-            setTimeout(() => {
-              connect().catch(() => {});
-            }, 2500);
+            setTimeout(() => connect().catch(() => {}), 2500);
           }
         }
       });
 
       sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
+
         for (const msg of messages || []) {
           const jid = msg?.key?.remoteJid;
           if (!jid || !jid.endsWith('@s.whatsapp.net')) continue;
@@ -515,19 +570,27 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
           const lead = getLead(jid);
 
           if (!fromMe) {
-            // inbound
+            // IMPORTANT: no marcar leído para no comerse notificaciones en el celular
+            if (READ_INBOUND_MESSAGES && !SILENT_MODE) {
+              try {
+                await sock.readMessages?.([msg.key]);
+              } catch (_) {}
+            }
+
             lead.lastInboundAt = nowTs();
             lead.updatedAt = nowTs();
 
-            // parse básico año/modelo si todavía no lo tenemos
+            // parse básico año/modelo
             const parsed = parseCarInfo(text);
             if (parsed.year && !lead.year) lead.year = parsed.year;
-            if (parsed.model && (!lead.model || lead.model.length < parsed.model.length)) lead.model = parsed.model;
+            if (parsed.model && (!lead.model || parsed.model.length > String(lead.model || '').length)) {
+              lead.model = parsed.model;
+            }
 
-            // si es lead nuevo, programar step0
-            if (!lead.stepIndex) {
+            // si nuevo lead, programar step0
+            if (!lead.stepIndex && !lead.nextAt) {
               lead.stepIndex = 0;
-              lead.nextAt = Date.now(); // scheduler lo toma
+              lead.nextAt = Date.now();
             }
 
             data.leads[jid] = lead;
@@ -540,11 +603,8 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
               model: lead.model || null,
               year: lead.year || null,
             });
-
-            // comandos del vendedor (si el vendedor escribe desde su propio WhatsApp al cliente)
-            // OJO: esto en grupos/escenarios complejos puede necesitar ajuste. Acá lo dejamos solo para mensajes salientes.
           } else {
-            // comando manual si el vendedor envía texto al lead
+            // comandos manuales (enviados por el vendedor)
             const c = data.config.commands || {};
             const txt = String(text || '').trim().toUpperCase();
 
@@ -570,13 +630,14 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   }
 
   async function disconnect() {
+    manualDisconnect = true;
     try { sock?.end?.(new Error('manual_disconnect')); } catch (_) {}
     try { sock?.ws?.close?.(); } catch (_) {}
     sock = null;
     setState({ connected: false });
   }
 
-  // ---------- métodos usados por server.js ----------
+  // ===== Métodos usados por server.js =====
   function getStatus() {
     return { ...state };
   }
@@ -606,7 +667,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   }
 
   function updateMessages(patch = {}) {
-    data.messagesConfig = { ...data.messagesConfig, ...patch };
+    data.messagesConfig = { ...data.messagesConfig, ...(patch || {}) };
     saveMessages();
     return true;
   }
@@ -614,21 +675,18 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   function updateConfig(patch = {}) {
     data.config = {
       ...data.config,
-      ...patch,
-      window: { ...(data.config.window || {}), ...(patch.window || {}) },
-      limits: { ...(data.config.limits || {}), ...(patch.limits || {}) },
-      rules: { ...(data.config.rules || {}), ...(patch.rules || {}) },
-      commands: { ...(data.config.commands || {}), ...(patch.commands || {}) },
+      ...(patch || {}),
+      window: { ...(data.config.window || {}), ...((patch || {}).window || {}) },
+      limits: { ...(data.config.limits || {}), ...((patch || {}).limits || {}) },
+      rules: { ...(data.config.rules || {}), ...((patch || {}).rules || {}) },
+      commands: { ...(data.config.commands || {}), ...((patch || {}).commands || {}) },
     };
     saveConfig();
     return true;
   }
 
   function setCommands(cmds = {}) {
-    data.config.commands = {
-      ...(data.config.commands || {}),
-      ...cmds,
-    };
+    data.config.commands = { ...(data.config.commands || {}), ...(cmds || {}) };
     saveConfig();
     return true;
   }
@@ -636,8 +694,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   function updateLead(jid, patch = {}) {
     if (!jid) return false;
     const lead = getLead(jid);
-    const next = { ...lead, ...patch, updatedAt: nowTs() };
-    data.leads[jid] = next;
+    data.leads[jid] = { ...lead, ...(patch || {}), updatedAt: nowTs() };
     saveLeads();
     return true;
   }
@@ -654,7 +711,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   function stopFollowUp(jid) {
     const lead = getLead(jid);
     lead.stage = 'perdido';
-    lead.pausedUntil = Date.now() + 365 * 24 * 60 * 60 * 1000; // pausa longa
+    lead.pausedUntil = Date.now() + 365 * 24 * 60 * 60 * 1000;
     lead.updatedAt = nowTs();
     data.leads[jid] = lead;
     saveLeads();
@@ -676,12 +733,14 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     lead.stage = 'perdido';
     lead.updatedAt = nowTs();
     data.leads[jid] = lead;
+
     data.blocked[phone || lead.phoneKey || jidToPhoneKey(jid)] = {
       ts: nowTs(),
       iso: new Date().toISOString(),
       reason,
       jid,
     };
+
     saveLeads();
     saveBlocked();
     ev('blocked', { jid, phoneKey: lead.phoneKey, reason });
@@ -700,15 +759,18 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   function programStartMessage(phoneKey, date, time = '09:00', text = '') {
     const jid = phoneKeyToJid(phoneKey);
     if (!jid) return false;
-    const ts = new Date(`${date}T${time}:00`).getTime();
-    data.scheduledStarts[jid] = { at: ts, text: String(text || '') };
+
+    const at = new Date(`${date}T${time}:00`).getTime();
+    data.scheduledStarts[jid] = { at, text: String(text || '') };
+
     const lead = getLead(jid);
     lead.stage = 'programado';
     lead.updatedAt = nowTs();
     data.leads[jid] = lead;
+
     saveLeads();
     saveScheduled();
-    ev('program_start_set', { jid, phoneKey: lead.phoneKey, at: ts });
+    ev('program_start_set', { jid, phoneKey: lead.phoneKey, at });
     return true;
   }
 
@@ -718,24 +780,20 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
 
     const baseTs = new Date(`${date}T${time}:00`).getTime();
     const oneDay = 24 * 60 * 60 * 1000;
-    const list = data.agendas[jid] || [];
 
-    const items = [
+    data.agendas[jid] = [
       { key: 'agenda0', at: baseTs - 7 * oneDay, data: tplData, sent: false },
       { key: 'agenda1', at: baseTs - 3 * oneDay, data: tplData, sent: false },
       { key: 'agenda2', at: baseTs - 1 * oneDay, data: tplData, sent: false },
-    ];
-
-    // remove existentes e substitui
-    data.agendas[jid] = items.filter(x => x.at > Date.now() - oneDay);
-    saveAgendas();
+    ].filter(x => x.at > Date.now() - oneDay);
 
     const lead = getLead(jid);
     lead.stage = 'agendado';
     lead.updatedAt = nowTs();
     data.leads[jid] = lead;
-    saveLeads();
 
+    saveLeads();
+    saveAgendas();
     ev('agenda_programada', { jid, phoneKey: lead.phoneKey, baseTs });
     return true;
   }
@@ -743,6 +801,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   async function sendConfirmNow(phoneKey, tplData = {}) {
     const jid = phoneKeyToJid(phoneKey);
     if (!jid) return { ok: false, error: 'bad_phone' };
+
     const tpl = data.messagesConfig.confirmTemplate || '';
     const text = applyTemplate(tpl, {
       DATA: tplData.DATA || '',
@@ -753,6 +812,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
       SINAL: tplData.SINAL || '',
       PAGAMENTO: tplData.PAGAMENTO || '',
     });
+
     return sendTextSafe(jid, text, { step: 'confirmTemplate', agenda: true });
   }
 
@@ -779,6 +839,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     const key = payload.productKey || 'ironGlassPlus';
     const q = data.quotesConfig[key] || data.quotesConfig.ironGlassPlus;
     const tpl = q.template || '';
+
     const text = applyTemplate(tpl, {
       VEICULO: payload.vehicle || lead.model || '',
       ANO: payload.year || lead.year || '',
@@ -790,20 +851,17 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   }
 
   function updateQuotes(nextQuotes = {}) {
-    data.quotesConfig = { ...data.quotesConfig, ...nextQuotes };
+    data.quotesConfig = { ...data.quotesConfig, ...(nextQuotes || {}) };
     saveQuotes();
     return true;
   }
-
-  // start scheduler even if not connected (for state maintenance)
-  setState({ enabled: true });
 
   return {
     // WA
     connect,
     disconnect,
 
-    // state/panel
+    // panel/state
     getStatus,
     setEnabled,
     getConfig,
@@ -824,7 +882,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     blockFollowUp,
     markAsClient,
 
-    // agenda/program/quote
+    // agenda / program / quote
     scheduleAgendaFromPanel,
     sendConfirmNow,
     cancelAgenda,
