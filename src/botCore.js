@@ -107,7 +107,7 @@ function keyDay(ts=Date.now()){
 function defaultConfig(){
   return {
     enabled: true,
-    window: { startHour: 9, endHour: 22 }, // tu panel usa esto :contentReference[oaicite:4]{index=4}
+    window: { startHour: 9, endHour: 22 },
     limits: { perMinute: 8, perHour: 120, perDay: 400, perContactPerDay: 2 },
     rules: { minYearFollowUp: 2022 },
     commands: { stop:'STOP', pause:'PAUSE', client:'CLIENTE', remove:'REMOVE', botOff:'BOT OFF' },
@@ -131,9 +131,9 @@ function defaultData(){
     scheduledStarts: {},
     counters: { byMinute:{}, byHour:{}, byDay:{}, byContactDay:{} },
     quotesConfig: {
-      ironGlass: { template: '🛡️ *Cotização Iron Glass*\n🚗 {{VEICULO}} {{ANO}}\n💰 {{VALOR}}\n💳 {{PAGAMENTO}}' },
-      ironGlassPlus: { template: '🛡️ *Cotização Iron Glass Plus*\n🚗 {{VEICULO}} {{ANO}}\n💰 {{VALOR}}\n💳 {{PAGAMENTO}}' },
-      defender: { template: '🛡️ *Cotização Defender*\n🚗 {{VEICULO}} {{ANO}}\n💰 {{VALOR}}\n💳 {{PAGAMENTO}}' },
+      ironGlass: { template: '🛡️ *Cotização Iron Glass*\\n🚗 {{VEICULO}} {{ANO}}\\n💰 {{VALOR}}\\n💳 {{PAGAMENTO}}' },
+      ironGlassPlus: { template: '🛡️ *Cotização Iron Glass Plus*\\n🚗 {{VEICULO}} {{ANO}}\\n💰 {{VALOR}}\\n💳 {{PAGAMENTO}}' },
+      defender: { template: '🛡️ *Cotização Defender*\\n🚗 {{VEICULO}} {{ANO}}\\n💰 {{VALOR}}\\n💳 {{PAGAMENTO}}' },
     }
   };
 }
@@ -393,7 +393,6 @@ function createBot({ botId, baseDir, authDir, eventLogger } = {}) {
   }
 
   async function processScheduledStarts(now){
-    // envía programados y luego mete en funil
     const entries = Object.entries(data.scheduledStarts||{});
     for (const [jid, obj] of entries){
       if (!obj?.at) continue;
@@ -405,10 +404,9 @@ function createBot({ botId, baseDir, authDir, eventLogger } = {}) {
       const txt = String(obj.text || '').trim();
       if (txt) await sendTextSafe(jid, txt, { step:'programado', program:true });
 
-      // entra en funil
       lead.stage = 'novo';
       lead.stepIndex = 0;
-      lead.nextAt = now + 5*60*1000; // arranca 5 min después
+      lead.nextAt = now + 5*60*1000;
       lead.updatedAt = nowTs();
       data.leads[jid]=lead;
 
@@ -420,7 +418,6 @@ function createBot({ botId, baseDir, authDir, eventLogger } = {}) {
   }
 
   async function processAgendas(now){
-    // ✅ blindaje: máximo 1 mensaje por contacto por tick
     for (const [jid, arr] of Object.entries(data.agendas||{})){
       if (!Array.isArray(arr) || !arr.length) continue;
 
@@ -441,7 +438,6 @@ function createBot({ botId, baseDir, authDir, eventLogger } = {}) {
         }
       }
 
-      // limpieza (7 días)
       data.agendas[jid] = arr.filter(x => !x.sent || (Date.now() - Number(x.at||0) < 7*24*60*60*1000));
     }
     saveAgendas();
@@ -474,15 +470,12 @@ function createBot({ botId, baseDir, authDir, eventLogger } = {}) {
         lead.stepIndex = idx+1;
         lead.updatedAt = nowTs();
 
-        // cadencia (3-5-7-15-30) configurable o default simple:
         const cadence = (data.config.cadenceDays || [3,5,7,15,30]);
         const days = Number(cadence[Math.min(idx, cadence.length-1)] || 3);
         lead.nextAt = Date.now() + days*24*60*60*1000;
 
         data.leads[lead.jid]=lead;
         saveLeads();
-      } else {
-        // si falló por límites, no hacemos nada (ya espera dentro de sendTextSafe)
       }
     }
   }
@@ -576,7 +569,6 @@ function createBot({ botId, baseDir, authDir, eventLogger } = {}) {
             data.leads[jid]=lead;
             saveLeads();
 
-            // log para stats (tu server filtra inbound_message en /m/stats)
             ev('inbound_message', {
               jid,
               phoneKey: lead.phoneKey,
@@ -585,7 +577,6 @@ function createBot({ botId, baseDir, authDir, eventLogger } = {}) {
               year: lead.year || ''
             });
 
-            // comandos (si están configurados)
             const c = data.config.commands || {};
             const txt = String(text||'').trim().toUpperCase();
             if (c.stop && txt === String(c.stop).trim().toUpperCase()) {
