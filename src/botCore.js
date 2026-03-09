@@ -1,5 +1,15 @@
-const fs = require('fs');
+// botCore.js — Iron Glass WhatsApp Bot (BLINDADO)
+// - Cola global + cooldown global
+// - Cola/cooldown por contacto (1 min real configurable)
+// - Dedupe de mensajes entrantes (evita doble procesamiento por reconexión)
+// - Scheduler sin solaparse (no corre ticks en paralelo)
+// - Stats por hora local (TZ=America/Sao_Paulo)
+// - Límites por minuto/hora/día y por contacto/día: si se alcanza, ESPERA (no dispara ráfagas)
+
+'use strict';
+
 const path = require('path');
+const fs = require('fs');
 const P = require('pino');
 
 const {
@@ -10,211 +20,209 @@ const {
   makeCacheableSignalKeyStore,
 } = require('@whiskeysockets/baileys');
 
+// Ajustá estos imports a tus utils reales:
 const {
-  ensureDir,
-  loadJSON,
-  saveJSON,
+  loadJSON, saveJSON,
   applyTemplate,
-  sleep,
-  nowTs,
-  randomInt,
-  jidToPhoneKey,
-  phoneKeyToJid,
-  isWithinWindow,
-  parseCarInfo,
+  normalizePhoneKeyFromJid,
 } = require('./utils');
 
-function createBot({ botId, baseDir, authDir, eventLogger }) {
-  const dataBase = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(baseDir, 'data');
-  const botDir = path.join(dataBase, botId);
-  ensureDir(botDir);
+// ==========================
+// ENV / FLAGS
+// ==========================
+const SILENT_MODE = String(process.env.SILENT_MODE || 'true') === 'true';
+const MARK_ONLINE = String(process.env.MARK_ONLINE_ON_CONNECT || 'false') === 'true';
+const READ_INBOUND_MESSAGES = String(process.env.READ_INBOUND_MESSAGES || 'false') === 'true';
+const SEND_PRESENCE_UPDATES = String(process.env.SEND_PRESENCE_UPDATES || 'false') === 'true';
+
+// Delays “humanos”
+const MIN_DELAY_MS = Number(process.env.MIN_DELAY_MS || 1500);
+const MAX_DELAY_MS = Number(process.env.MAX_DELAY_MS || 3000);
+
+// Blindaje (recomendado)
+const PER_CONTACT_GAP_MS = Number(process.env.PER_CONTACT_GAP_MS || 60000); // 1 minuto real por contacto
+const GLOBAL_GAP_MS = Number(process.env.GLOBAL_GAP_MS || 2500);            // gap global entre cualquier envío
+const DEDUPE_TTL_MS = Number(process.env.DEDUPE_TTL_MS || 10 * 60 * 1000);  // 10 min
+
+// Scheduler
+const SCHEDULER_TICK_MS = Number(process.env.SCHEDULER_TICK_MS || 5000);
+
+// Ventana (si tu config no trae, esto es fallback)
+const DEFAULT_WINDOW = { start: '08:00', end: '20:00' };
+
+// ==========================
+// Helpers
+// ==========================
+function ensureDir(dir) { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); }
+function nowTs() { return Date.now(); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function randomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+
+function parseHHMM(s, fallback) {
+  const m = String(s || '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return fallback;
+  const hh = Math.max(0, Math.min(23, Number(m[1])));
+  const mm = Math.max(0, Math.min(59, Number(m[2])));
+  return { hh, mm };
+}
+
+function isWithinWindow(windowCfg) {
+  const w = windowCfg && windowCfg.start && windowCfg.end ? windowCfg : DEFAULT_WINDOW;
+  const start = parseHHMM(w.start, { hh: 8, mm: 0 });
+  const end = parseHHMM(w.end, { hh: 20, mm: 0 });
+
+  const d = new Date();
+  const mins = d.getHours() * 60 + d.getMinutes();
+  const startM = start.hh * 60 + start.mm;
+  const endM = end.hh * 60 + end.mm;
+
+  if (startM <= endM) return mins >= startM && mins <= endM;
+  // ventana cruza medianoche
+  return mins >= startM || mins <= endM;
+}
+
+// ==========================
+// Data files
+// ==========================
+function makeFiles(dataDir) {
+  return {
+    config: path.join(dataDir, 'config.json'),
+    messages: path.join(dataDir, 'messages.json'),
+    leads: path.join(dataDir, 'leads.json'),
+    agendas: path.join(dataDir, 'agendas.json'),
+    scheduled: path.join(dataDir, 'scheduledStarts.json'),
+    counters: path.join(dataDir, 'counters.json'),
+    events: path.join(dataDir, 'events.json'),
+  };
+}
+
+function defaultCounters() {
+  return {
+    byMinute: {},
+    byHour: {},
+    byDay: {},
+    byContactDay: {},
+  };
+}
+
+function defaultConfig() {
+  return {
+    enabled: true,
+    window: DEFAULT_WINDOW,
+    limits: {
+      perMinute: 8,
+      perHour: 120,
+      perDay: 400,
+      perContactPerDay: 2,
+    },
+    rules: {
+      minYearFollowUp: 2022
+    }
+  };
+}
+
+function defaultMessages() {
+  return {
+    // ejemplo:
+    agenda0: 'Olá! Lembrete do seu agendamento.',
+  };
+}
+
+// ==========================
+// Bot Factory
+// ==========================
+function createBot(opts = {}) {
+  const dataDir = opts.dataDir || path.join(process.cwd(), 'data');
+  const authDir = opts.authDir || path.join(process.cwd(), 'auth');
+
+  ensureDir(dataDir);
   ensureDir(authDir);
 
-  const FILES = {
-    config: path.join(botDir, 'config.json'),
-    messages: path.join(botDir, 'messages.json'),
-    leads: path.join(botDir, 'leads.json'),
-    blocked: path.join(botDir, 'blocked.json'),
-    scheduled: path.join(botDir, 'programados.json'),
-    agendas: path.join(botDir, 'agendas.json'),
-    quotes: path.join(botDir, 'quotes.json'),
-    counters: path.join(botDir, 'counters.json'),
+  const FILES = makeFiles(dataDir);
+
+  const data = {
+    config: loadJSON(FILES.config, defaultConfig()),
+    messagesConfig: loadJSON(FILES.messages, defaultMessages()),
+    leads: loadJSON(FILES.leads, {}),
+    agendas: loadJSON(FILES.agendas, {}),
+    scheduledStarts: loadJSON(FILES.scheduled, {}),
+    counters: loadJSON(FILES.counters, defaultCounters()),
+    events: loadJSON(FILES.events, []),
   };
 
-  const defaults = {
-    config: {
-      window: { startHour: 9, endHour: 22 },
-      limits: { perMinute: 8, perHour: 120, perDay: 400, perContactPerDay: 2 },
-      rules: { minYearFollowUp: 2022 },
-      commands: { stop: 'STOP', pause: 'PAUSE', client: 'CLIENTE', remove: 'REMOVE', botOff: 'BOT OFF' },
-    },
-    messagesConfig: {
-      step0: 'Oi! Carlos por aqui 😊 Tudo certo? Você ainda quer proteger os vidros do seu carro?',
-      step1: 'Passando para saber se posso te ajudar com alguma dúvida sobre a proteção dos vidros 😊',
-      step2: 'Se quiser, posso te enviar uma cotização sem compromisso 👍',
-      step3: 'Última mensagem por aqui 😊 Se ainda tiver interesse, me chama que te atendo com prazer.',
-      extra: '',
-      postSale30: 'Oi! Tudo bem? Passando só para saber como está a experiência com a Iron Glass 😊',
-      agenda0: 'Olá! Faltam 7 dias para seu agendamento na Iron Glass.',
-      agenda1: 'Olá! Faltam 3 dias para seu agendamento na Iron Glass.',
-      agenda2: 'Olá! Seu agendamento é amanhã. Qualquer dúvida me chama 😊',
-      confirmTemplate:
-        '✅ *Agendamento confirmado*\n' +
-        '📅 Data: {{DATA}}\n' +
-        '🕒 Hora: {{HORA}}\n' +
-        '🚗 Veículo: {{VEICULO}}\n' +
-        '🛡️ Produto: {{PRODUTO}}\n' +
-        '💰 Valor: {{VALOR}}\n' +
-        '💳 Pagamento: {{PAGAMENTO}}',
-    },
-    quotesConfig: {
-      ironGlass: {
-        template:
-          '🛡️ *Cotização Iron Glass*\n' +
-          '🚗 Veículo: {{VEICULO}} {{ANO}}\n' +
-          '💰 Valor: {{VALOR}}\n' +
-          '💳 Pagamento: {{PAGAMENTO}}',
-      },
-      ironGlassPlus: {
-        template:
-          '🛡️ *Cotização Iron Glass Plus*\n' +
-          '🚗 Veículo: {{VEICULO}} {{ANO}}\n' +
-          '💰 Valor: {{VALOR}}\n' +
-          '💳 Pagamento: {{PAGAMENTO}}',
-      },
-      defender: {
-        template:
-          '🛡️ *Cotização Defender*\n' +
-          '🚗 Veículo: {{VEICULO}} {{ANO}}\n' +
-          '💰 Valor: {{VALOR}}\n' +
-          '💳 Pagamento: {{PAGAMENTO}}',
-      },
-    },
-    blocked: {},
-    leads: {},
-    scheduledStarts: {},
-    agendas: {},
-    counters: {
-      byMinute: {},
-      byHour: {},
-      byDay: {},
-      byContactDay: {},
-    },
-  };
-
-  let data = {
-    config: loadJSON(FILES.config, defaults.config),
-    messagesConfig: loadJSON(FILES.messages, defaults.messagesConfig),
-    leads: loadJSON(FILES.leads, defaults.leads),
-    blocked: loadJSON(FILES.blocked, defaults.blocked),
-    scheduledStarts: loadJSON(FILES.scheduled, defaults.scheduledStarts),
-    agendas: loadJSON(FILES.agendas, defaults.agendas),
-    quotesConfig: loadJSON(FILES.quotes, defaults.quotesConfig),
-    counters: loadJSON(FILES.counters, defaults.counters),
-  };
-
-  data.config = { ...defaults.config, ...(data.config || {}) };
-  data.config.window = { ...defaults.config.window, ...(data.config.window || {}) };
-  data.config.limits = { ...defaults.config.limits, ...(data.config.limits || {}) };
-  data.config.rules = { ...defaults.config.rules, ...(data.config.rules || {}) };
-  data.config.commands = { ...defaults.config.commands, ...(data.config.commands || {}) };
-  data.messagesConfig = { ...defaults.messagesConfig, ...(data.messagesConfig || {}) };
-  data.quotesConfig = { ...defaults.quotesConfig, ...(data.quotesConfig || {}) };
-  data.counters = { ...defaults.counters, ...(data.counters || {}) };
-  data.counters.byMinute = data.counters.byMinute || {};
-  data.counters.byHour = data.counters.byHour || {};
-  data.counters.byDay = data.counters.byDay || {};
-  data.counters.byContactDay = data.counters.byContactDay || {};
-
-  function persistAll() {
-    saveJSON(FILES.config, data.config);
-    saveJSON(FILES.messages, data.messagesConfig);
-    saveJSON(FILES.leads, data.leads);
-    saveJSON(FILES.blocked, data.blocked);
-    saveJSON(FILES.scheduled, data.scheduledStarts);
-    saveJSON(FILES.agendas, data.agendas);
-    saveJSON(FILES.quotes, data.quotesConfig);
-    saveJSON(FILES.counters, data.counters);
-  }
-  persistAll();
-
-  // ===== Silent mode =====
-  const SILENT_MODE = String(process.env.SILENT_MODE ?? 'true').toLowerCase() === 'true';
-  const MARK_ONLINE = String(process.env.MARK_ONLINE_ON_CONNECT ?? 'false').toLowerCase() === 'true';
-  const READ_INBOUND_MESSAGES = String(process.env.READ_INBOUND_MESSAGES ?? 'false').toLowerCase() === 'true';
-  const SEND_PRESENCE_UPDATES = String(process.env.SEND_PRESENCE_UPDATES ?? 'false').toLowerCase() === 'true';
-
+  // ==========================
+  // State
+  // ==========================
   let sock = null;
   let connecting = false;
-  let schedulerHandle = null;
   let manualDisconnect = false;
 
-  let state = {
+  const state = {
+    enabled: true,
     connected: false,
-    enabled: true, // controla funil/envíos, no conexión
     qr: null,
-    queueSize: 0,
     lastError: null,
-    lastUpdate: new Date().toISOString(),
+    queueSize: 0,
+    lastSendAt: 0,
   };
 
-  function setState(patch) {
-    state = { ...state, ...patch, lastUpdate: new Date().toISOString() };
+  function setState(patch) { Object.assign(state, patch); }
+
+  // ==========================
+  // Persistence helpers
+  // ==========================
+  function saveConfig() { saveJSON(FILES.config, data.config); }
+  function saveMessages() { saveJSON(FILES.messages, data.messagesConfig); }
+  function saveLeads() { saveJSON(FILES.leads, data.leads); }
+  function saveAgendas() { saveJSON(FILES.agendas, data.agendas); }
+  function saveScheduled() { saveJSON(FILES.scheduled, data.scheduledStarts); }
+  function saveCounters() { saveJSON(FILES.counters, data.counters); }
+  function saveEvents() { saveJSON(FILES.events, data.events); }
+
+  function ev(type, payload) {
+    data.events.push({ at: nowTs(), type, payload: payload || {} });
+    // recorte para no crecer infinito:
+    if (data.events.length > 2000) data.events.splice(0, data.events.length - 2000);
+    saveEvents();
   }
 
-  function ev(action, extra = {}) {
-    try {
-      eventLogger && eventLogger({
-        botId,
-        ts: Date.now(),
-        iso: new Date().toISOString(),
-        action,
-        ...extra,
-      });
-    } catch (_) {}
-  }
-
+  // ==========================
+  // Lead helpers
+  // ==========================
   function getLead(jid) {
     if (!data.leads[jid]) {
-      const phoneKey = jidToPhoneKey(jid);
       data.leads[jid] = {
         jid,
-        phoneKey,
+        phoneKey: normalizePhoneKeyFromJid ? normalizePhoneKeyFromJid(jid) : jid,
         createdAt: nowTs(),
         updatedAt: nowTs(),
         lastInboundAt: 0,
         lastOutboundAt: 0,
-        stage: 'novo',
         stepIndex: 0,
-        nextAt: 0,
-        pausedUntil: 0,
-        manualOffUntil: 0,
+        nextAt: null,
         blocked: false,
+        pausedUntil: null,
+        manualOffUntil: null,
         isClient: false,
-        tags: [],
-        notes: '',
-        name: '',
-        model: '',
         year: null,
-        dedupe: {},
+        model: '',
       };
-      saveJSON(FILES.leads, data.leads);
+      saveLeads();
     }
     return data.leads[jid];
   }
 
-  function saveLeads() { saveJSON(FILES.leads, data.leads); }
-  function saveConfig() { saveJSON(FILES.config, data.config); }
-  function saveMessages() { saveJSON(FILES.messages, data.messagesConfig); }
-  function saveBlocked() { saveJSON(FILES.blocked, data.blocked); }
-  function saveScheduled() { saveJSON(FILES.scheduled, data.scheduledStarts); }
-  function saveAgendas() { saveJSON(FILES.agendas, data.agendas); }
-  function saveQuotes() { saveJSON(FILES.quotes, data.quotesConfig); }
-  function saveCounters() { saveJSON(FILES.counters, data.counters); }
-
-  // ===== queue / anti-parallel =====
+  // ==========================
+  // Queue + rate limit (BLINDADO)
+  // ==========================
   let sendQueue = Promise.resolve();
   let queueCount = 0;
+
+  // per-contact next allowed time
+  const contactNextAt = new Map();
+
+  // dedupe inbound
+  const recentMsg = new Map(); // id -> ts
 
   function enqueue(task) {
     queueCount += 1;
@@ -227,32 +235,40 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
         queueCount = Math.max(0, queueCount - 1);
         setState({ queueSize: queueCount });
       }
-    }).catch(() => {});
+    });
+
+    // No tragues errores silenciosamente:
+    sendQueue = sendQueue.catch((e) => {
+      setState({ lastError: String(e?.message || e) });
+      ev('queue_error', { error: String(e?.message || e) });
+    });
 
     return sendQueue;
   }
 
+  // ===== Keys (LOCAL TIME) =====
   function keyMinute(ts = Date.now()) {
     const d = new Date(ts);
-    return `${d.getUTCFullYear()}-${d.getUTCMonth()+1}-${d.getUTCDate()}-${d.getUTCHours()}-${d.getUTCMinutes()}`;
+    return `${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}-${d.getHours()}-${d.getMinutes()}`;
   }
   function keyHour(ts = Date.now()) {
     const d = new Date(ts);
-    return `${d.getUTCFullYear()}-${d.getUTCMonth()+1}-${d.getUTCDate()}-${d.getUTCHours()}`;
+    return `${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}-${d.getHours()}`;
   }
   function keyDay(ts = Date.now()) {
     const d = new Date(ts);
-    return `${d.getUTCFullYear()}-${d.getUTCMonth()+1}-${d.getUTCDate()}`;
+    return `${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}`;
   }
 
   function pruneCounters() {
-    const keepM = new Set([keyMinute(), keyMinute(Date.now()-60000), keyMinute(Date.now()-120000)]);
+    const now = Date.now();
+    const keepM = new Set([keyMinute(now), keyMinute(now-60000), keyMinute(now-120000), keyMinute(now-180000)]);
     for (const k of Object.keys(data.counters.byMinute)) if (!keepM.has(k)) delete data.counters.byMinute[k];
 
-    const keepH = new Set([keyHour(), keyHour(Date.now()-3600000)]);
+    const keepH = new Set([keyHour(now), keyHour(now-3600000), keyHour(now-7200000)]);
     for (const k of Object.keys(data.counters.byHour)) if (!keepH.has(k)) delete data.counters.byHour[k];
 
-    const keepD = new Set([keyDay(), keyDay(Date.now()-86400000)]);
+    const keepD = new Set([keyDay(now), keyDay(now-86400000), keyDay(now-2*86400000)]);
     for (const k of Object.keys(data.counters.byDay)) if (!keepD.has(k)) delete data.counters.byDay[k];
 
     for (const k of Object.keys(data.counters.byContactDay)) {
@@ -264,9 +280,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   function canSendNow(jid) {
     pruneCounters();
 
-    if (!isWithinWindow(data.config.window || {})) {
-      return { ok: false, reason: 'outside_window' };
-    }
+    if (!isWithinWindow(data.config.window || {})) return { ok: false, reason: 'outside_window' };
 
     const limits = data.config.limits || {};
     const ts = Date.now();
@@ -304,29 +318,62 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
     try { await sock?.sendPresenceUpdate?.(type, jid); } catch (_) {}
   }
 
+  // Espera hasta que los límites vuelvan a permitir enviar (en vez de spammear/soltar todo junto)
+  async function waitForLimits(jid) {
+    while (true) {
+      const ok = canSendNow(jid);
+      if (ok.ok) return;
+      // Esperas “inteligentes” según el tipo de límite
+      if (ok.reason === 'outside_window') {
+        // Espera 60s y reintenta (simple y seguro)
+        await sleep(60000);
+      } else if (ok.reason === 'limit_minute') {
+        await sleep(30000);
+      } else if (ok.reason === 'limit_hour') {
+        await sleep(5 * 60 * 1000);
+      } else if (ok.reason === 'limit_day' || ok.reason === 'limit_contact_day') {
+        await sleep(30 * 60 * 1000);
+      } else {
+        await sleep(10000);
+      }
+    }
+  }
+
   async function sendTextSafe(jid, text, meta = {}) {
     if (!sock || !state.connected) return { ok: false, error: 'not_connected' };
 
     const lead = getLead(jid);
-    const precheck = canSendNow(jid);
-    if (!precheck.ok) return { ok: false, error: precheck.reason };
-
-    const minDelay = Number(process.env.MIN_DELAY_MS || 1500);
-    const maxDelay = Number(process.env.MAX_DELAY_MS || 3000);
 
     return enqueue(async () => {
-      const check = canSendNow(jid);
-      if (!check.ok) return { ok: false, error: check.reason };
+      // 0) Espera ventana y límites (NO dispara ráfaga)
+      await waitForLimits(jid);
 
-      await sleep(randomInt(minDelay, maxDelay));
+      // 1) Cooldown por contacto (1 min real)
+      const nextContact = contactNextAt.get(jid) || 0;
+      const waitContact = Math.max(0, nextContact - Date.now());
+      if (waitContact > 0) await sleep(waitContact);
+
+      // 2) Cooldown global (entre cualquier envío)
+      const waitGlobal = Math.max(0, (state.lastSendAt + GLOBAL_GAP_MS) - Date.now());
+      if (waitGlobal > 0) await sleep(waitGlobal);
+
+      // 3) Delay humano aleatorio
+      await sleep(randomInt(MIN_DELAY_MS, MAX_DELAY_MS));
+
       await maybePresence(jid, 'composing');
 
       try {
         await sock.sendMessage(jid, { text: String(text || '') });
         await maybePresence(jid, 'paused');
 
+        // marcar contadores SOLO aquí (envío real)
         markSendCounter(jid);
 
+        // Actualizar timers
+        state.lastSendAt = Date.now();
+        contactNextAt.set(jid, Date.now() + PER_CONTACT_GAP_MS);
+
+        // Lead stats
         lead.lastOutboundAt = nowTs();
         lead.updatedAt = nowTs();
         data.leads[jid] = lead;
@@ -335,110 +382,90 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
         ev('auto_sent', {
           jid,
           phoneKey: lead.phoneKey,
-          textPreview: String(text || '').slice(0, 120),
-          ...meta,
+          meta,
+          len: String(text || '').length
         });
 
         return { ok: true };
       } catch (e) {
-        setState({ lastError: String(e?.message || e) });
-        return { ok: false, error: String(e?.message || e) };
+        const msg = String(e?.message || e);
+        setState({ lastError: msg });
+        ev('send_error', { jid, error: msg, meta });
+        return { ok: false, error: msg };
       }
     });
   }
 
-  // ===== Funil =====
-  function stepKeys() {
-    return ['step0', 'step1', 'step2', 'step3'];
-  }
+  // ==========================
+  // Scheduler (NO overlap)
+  // ==========================
+  let schedulerHandle = null;
+  let schedulerRunning = false;
 
-  function scheduleNextByStep(lead) {
-    const idx = Number(lead.stepIndex || 0);
-    const delays = [0, 24*60*60*1000, 48*60*60*1000, 72*60*60*1000];
-    lead.nextAt = Date.now() + (delays[idx] ?? (24*60*60*1000));
-    lead.updatedAt = nowTs();
+  function stepKeys() {
+    // Si vos tenés steps en config, adaptalo aquí
+    // Ejemplo: data.messagesConfig tiene keys step0, step1...
+    const keys = Object.keys(data.messagesConfig || {}).filter(k => /^step\d+$/i.test(k));
+    keys.sort((a, b) => Number(a.replace(/\D/g, '')) - Number(b.replace(/\D/g, '')));
+    return keys;
   }
 
   async function trySendStep(lead, stepIdx) {
-    const key = stepKeys()[stepIdx];
-    if (!key) return { ok: false, error: 'step_end' };
+    const keys = stepKeys();
+    const key = keys[stepIdx];
+    if (!key) return;
 
-    const lastTs = Number(lead.dedupe?.[key] || 0);
-    if (Date.now() - lastTs < 10 * 60 * 1000) return { ok: false, error: 'dedupe' };
+    const tpl = data.messagesConfig[key] || '';
+    const text = applyTemplate(tpl, lead);
 
-    const txt = data.messagesConfig[key];
-    if (!txt || !String(txt).trim()) return { ok: false, error: 'empty_message' };
-
-    const out = await sendTextSafe(lead.jid, txt, { step: key });
+    const out = await sendTextSafe(lead.jid, text, { step: key, followup: true });
     if (out.ok) {
-      lead.dedupe = lead.dedupe || {};
-      lead.dedupe[key] = Date.now();
       lead.stepIndex = stepIdx + 1;
-      if (lead.stage === 'novo') lead.stage = 'em_negociacao';
-      scheduleNextByStep(lead);
+      lead.updatedAt = nowTs();
+
+      // Programación siguiente (ejemplo simple: 3 días)
+      const nextDelayDays = Number(process.env.FOLLOWUP_DAYS || 3);
+      lead.nextAt = Date.now() + nextDelayDays * 24 * 60 * 60 * 1000;
       data.leads[lead.jid] = lead;
       saveLeads();
-    }
-    return out;
-  }
-
-  async function processScheduledStarts(now) {
-    for (const [jid, item] of Object.entries(data.scheduledStarts || {})) {
-      if (!item?.at) continue;
-      if (now < Number(item.at)) continue;
-
-      const lead = getLead(jid);
-      if (lead.blocked) {
-        delete data.scheduledStarts[jid];
-        continue;
-      }
-
-      let text = String(item.text || '').trim();
-      if (!text) text = data.messagesConfig.step0 || '';
-
-      const out = await sendTextSafe(jid, text, { step: 'program_start' });
-      if (out.ok) {
-        lead.stage = 'programado';
-        lead.stepIndex = 1; // ya mandó el primer mensaje programado
-        lead.nextAt = now + 24 * 60 * 60 * 1000;
-        lead.updatedAt = nowTs();
-        lead.dedupe = lead.dedupe || {};
-        lead.dedupe.step0 = now;
-        data.leads[jid] = lead;
-
-        delete data.scheduledStarts[jid];
-        saveLeads();
-        saveScheduled();
-      }
     }
   }
 
   async function processAgendas(now) {
     let changed = false;
+
     for (const [jid, arr] of Object.entries(data.agendas || {})) {
       if (!Array.isArray(arr) || !arr.length) continue;
+
+      // ✅ Blindaje: solo 1 envío por contacto por tick
+      let sentOneThisTick = false;
 
       const nextArr = [];
       for (const ag of arr) {
         if (!ag?.at) continue;
         if (ag.sent) { nextArr.push(ag); continue; }
 
-        if (now >= Number(ag.at)) {
+        if (!sentOneThisTick && now >= Number(ag.at)) {
           const msgKey = ag.key || 'agenda0';
-          const tpl = data.messagesConfig[msgKey] || '';
+          const tpl = data.messagesConfig[msgKey] || data.messagesConfig.agenda0 || '';
           const text = applyTemplate(tpl, ag.data || {});
           const out = await sendTextSafe(jid, text, { step: msgKey, agenda: true });
+
           if (out.ok) {
             ag.sent = true;
             ag.sentAt = nowTs();
             changed = true;
+            sentOneThisTick = true;
           }
         }
+
         nextArr.push(ag);
       }
 
+      // limpieza (7 días)
       data.agendas[jid] = nextArr.filter(x => !x.sent || (Date.now() - Number(x.at || 0) < 7 * 24 * 60 * 60 * 1000));
     }
+
     if (changed) saveAgendas();
   }
 
@@ -451,7 +478,7 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
       if (lead.isClient) continue;
       if (lead.pausedUntil && now < Number(lead.pausedUntil)) continue;
       if (lead.manualOffUntil && now < Number(lead.manualOffUntil)) continue;
-      if (!lead.nextAt) continue; // ✅ NO inicia automático si no fue programado
+      if (!lead.nextAt) continue; // no arranca si no fue programado
       if (now < Number(lead.nextAt)) continue;
 
       const minYear = Number(data.config.rules?.minYearFollowUp || 2022);
@@ -465,22 +492,41 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
   }
 
   async function schedulerTick() {
-    const now = Date.now();
-    await processScheduledStarts(now);
-    await processAgendas(now);
-    await processFollowUps(now);
-    saveLeads();
+    if (schedulerRunning) return; // ✅ NO solapa ticks
+    schedulerRunning = true;
+    try {
+      const now = Date.now();
+      await processAgendas(now);
+      await processFollowUps(now);
+      saveLeads();
+    } finally {
+      schedulerRunning = false;
+    }
   }
 
   function startScheduler() {
     if (schedulerHandle) clearInterval(schedulerHandle);
     schedulerHandle = setInterval(() => {
       schedulerTick().catch((e) => setState({ lastError: String(e?.message || e) }));
-    }, 5000);
+    }, SCHEDULER_TICK_MS);
   }
-  startScheduler();
 
-  // ===== WhatsApp / Baileys =====
+  // ==========================
+  // WhatsApp / Baileys
+  // ==========================
+  function dedupeSeen(msgId) {
+    if (!msgId) return false;
+
+    const now = Date.now();
+    // limpia TTL
+    for (const [k, ts] of recentMsg.entries()) {
+      if (now - ts > DEDUPE_TTL_MS) recentMsg.delete(k);
+    }
+    if (recentMsg.has(msgId)) return true;
+    recentMsg.set(msgId, now);
+    return false;
+  }
+
   async function connect() {
     if (connecting) return;
     if (sock && state.connected) return;
@@ -543,7 +589,11 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
           const jid = msg?.key?.remoteJid;
           if (!jid || !jid.endsWith('@s.whatsapp.net')) continue;
 
+          const msgId = msg?.key?.id;
+          if (dedupeSeen(msgId)) continue; // ✅ dedupe
+
           const fromMe = !!msg?.key?.fromMe;
+
           const text =
             msg?.message?.conversation ||
             msg?.message?.extendedTextMessage?.text ||
@@ -556,56 +606,29 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
           const lead = getLead(jid);
 
           if (!fromMe) {
-            // ✅ NO marcar leído (para no perder notificaciones en el celular)
+            // ✅ NO marcar leído por defecto (no perder notificaciones)
             if (READ_INBOUND_MESSAGES && !SILENT_MODE) {
               try { await sock.readMessages?.([msg.key]); } catch (_) {}
             }
 
             lead.lastInboundAt = nowTs();
             lead.updatedAt = nowTs();
-
-            const parsed = parseCarInfo(text);
-            if (parsed.year && !lead.year) lead.year = parsed.year;
-            if (parsed.model && (!lead.model || parsed.model.length > String(lead.model || '').length)) {
-              lead.model = parsed.model;
-            }
-
-            // ✅ NO iniciar funil automático por inbound
-            // Solo registrar lead. El inicio se hace por Programar / agenda / acción manual.
-            if (lead.stepIndex == null) lead.stepIndex = 0;
-            if (!lead.nextAt) lead.nextAt = 0;
-
             data.leads[jid] = lead;
             saveLeads();
 
-            ev('inbound_message', {
-              jid,
-              phoneKey: lead.phoneKey,
-              textPreview: String(text).slice(0, 180),
-              model: lead.model || null,
-              year: lead.year || null,
-            });
+            ev('inbound', { jid, text: String(text).slice(0, 200) });
           } else {
-            // comandos manuales del vendedor
-            const c = data.config.commands || {};
-            const txt = String(text || '').trim().toUpperCase();
-
-            if (c.stop && txt === String(c.stop).trim().toUpperCase()) {
-              blockFollowUp(jid, lead.phoneKey, 'cmd_stop');
-            } else if (c.pause && txt === String(c.pause).trim().toUpperCase()) {
-              pauseFollowUp(jid, 72 * 60 * 60 * 1000);
-            } else if (c.client && txt === String(c.client).trim().toUpperCase()) {
-              markAsClient(jid);
-            } else if (c.remove && txt === String(c.remove).trim().toUpperCase()) {
-              stopFollowUp(jid);
-            } else if (c.botOff && txt === String(c.botOff).trim().toUpperCase()) {
-              setManualOff(jid, 24 * 60 * 60 * 1000);
-            }
+            // si querés contabilizar salientes manuales, lo podés hacer acá
           }
         }
       });
+
+      // Start scheduler once
+      startScheduler();
+
     } catch (e) {
-      setState({ lastError: String(e?.message || e), connected: false });
+      setState({ lastError: String(e?.message || e) });
+      ev('connect_error', { error: String(e?.message || e) });
     } finally {
       connecting = false;
     }
@@ -613,247 +636,40 @@ function createBot({ botId, baseDir, authDir, eventLogger }) {
 
   async function disconnect() {
     manualDisconnect = true;
-    try { sock?.end?.(new Error('manual_disconnect')); } catch (_) {}
-    try { sock?.ws?.close?.(); } catch (_) {}
+    try { await sock?.logout?.(); } catch (_) {}
+    try { sock?.end?.(); } catch (_) {}
     sock = null;
     setState({ connected: false });
   }
 
-  // ===== Métodos usados por server.js =====
-  function getStatus() { return { ...state }; }
-  function setEnabled(v) { setState({ enabled: !!v }); }
-  function getConfig() { return JSON.parse(JSON.stringify(data.config)); }
-  function getLeads() { return data.leads || {}; }
-
-  function getDataSnapshot() {
-    return {
-      config: data.config,
-      messagesConfig: data.messagesConfig,
-      leads: data.leads,
-      blocked: data.blocked,
-      scheduledStarts: data.scheduledStarts,
-      agendas: data.agendas,
-      quotesConfig: data.quotesConfig,
-    };
+  // ==========================
+  // Public API
+  // ==========================
+  function setEnabled(v) {
+    state.enabled = !!v;
+    data.config.enabled = !!v;
+    saveConfig();
   }
 
-  function updateMessages(patch = {}) {
-    data.messagesConfig = { ...data.messagesConfig, ...(patch || {}) };
+  function updateConfig(patch) {
+    data.config = Object.assign({}, data.config, patch || {});
+    saveConfig();
+  }
+
+  function updateMessages(patch) {
+    data.messagesConfig = Object.assign({}, data.messagesConfig, patch || {});
     saveMessages();
-    return true;
-  }
-
-  function updateConfig(patch = {}) {
-    data.config = {
-      ...data.config,
-      ...(patch || {}),
-      window: { ...(data.config.window || {}), ...((patch || {}).window || {}) },
-      limits: { ...(data.config.limits || {}), ...((patch || {}).limits || {}) },
-      rules: { ...(data.config.rules || {}), ...((patch || {}).rules || {}) },
-      commands: { ...(data.config.commands || {}), ...((patch || {}).commands || {}) },
-    };
-    saveConfig();
-    return true;
-  }
-
-  function setCommands(cmds = {}) {
-    data.config.commands = { ...(data.config.commands || {}), ...(cmds || {}) };
-    saveConfig();
-    return true;
-  }
-
-  function updateLead(jid, patch = {}) {
-    if (!jid) return false;
-    const lead = getLead(jid);
-    data.leads[jid] = { ...lead, ...(patch || {}), updatedAt: nowTs() };
-    saveLeads();
-    return true;
-  }
-
-  function pauseFollowUp(jid, ms) {
-    const lead = getLead(jid);
-    lead.pausedUntil = Date.now() + Number(ms || 0);
-    lead.updatedAt = nowTs();
-    data.leads[jid] = lead;
-    saveLeads();
-    ev('pause_followup', { jid, phoneKey: lead.phoneKey, ms });
-  }
-
-  function stopFollowUp(jid) {
-    const lead = getLead(jid);
-    lead.stage = 'perdido';
-    lead.pausedUntil = Date.now() + 365 * 24 * 60 * 60 * 1000;
-    lead.updatedAt = nowTs();
-    data.leads[jid] = lead;
-    saveLeads();
-    ev('stop_followup', { jid, phoneKey: lead.phoneKey });
-  }
-
-  function setManualOff(jid, ms) {
-    const lead = getLead(jid);
-    lead.manualOffUntil = Date.now() + Number(ms || 0);
-    lead.updatedAt = nowTs();
-    data.leads[jid] = lead;
-    saveLeads();
-    ev('manual_off', { jid, phoneKey: lead.phoneKey, ms });
-  }
-
-  function blockFollowUp(jid, phone, reason = 'manual') {
-    const lead = getLead(jid);
-    lead.blocked = true;
-    lead.stage = 'perdido';
-    lead.updatedAt = nowTs();
-    data.leads[jid] = lead;
-
-    data.blocked[phone || lead.phoneKey || jidToPhoneKey(jid)] = {
-      ts: nowTs(),
-      iso: new Date().toISOString(),
-      reason,
-      jid,
-    };
-
-    saveLeads();
-    saveBlocked();
-    ev('blocked', { jid, phoneKey: lead.phoneKey, reason });
-  }
-
-  function markAsClient(jid) {
-    const lead = getLead(jid);
-    lead.isClient = true;
-    lead.stage = 'fechado';
-    lead.updatedAt = nowTs();
-    data.leads[jid] = lead;
-    saveLeads();
-    ev('mark_client', { jid, phoneKey: lead.phoneKey });
-  }
-
-  function programStartMessage(phoneKey, date, time = '09:00', text = '') {
-    const jid = phoneKeyToJid(phoneKey);
-    if (!jid) return false;
-
-    const at = new Date(`${date}T${time}:00`).getTime();
-    data.scheduledStarts[jid] = { at, text: String(text || '') };
-
-    const lead = getLead(jid);
-    lead.stage = 'programado';
-    lead.updatedAt = nowTs();
-    data.leads[jid] = lead;
-
-    saveLeads();
-    saveScheduled();
-    ev('program_start_set', { jid, phoneKey: lead.phoneKey, at });
-    return true;
-  }
-
-  function scheduleAgendaFromPanel(phoneKey, date, time, tplData = {}) {
-    const jid = phoneKeyToJid(phoneKey);
-    if (!jid) return false;
-
-    const baseTs = new Date(`${date}T${time}:00`).getTime();
-    const oneDay = 24 * 60 * 60 * 1000;
-
-    data.agendas[jid] = [
-      { key: 'agenda0', at: baseTs - 7 * oneDay, data: tplData, sent: false },
-      { key: 'agenda1', at: baseTs - 3 * oneDay, data: tplData, sent: false },
-      { key: 'agenda2', at: baseTs - 1 * oneDay, data: tplData, sent: false },
-    ].filter(x => x.at > Date.now() - oneDay);
-
-    const lead = getLead(jid);
-    lead.stage = 'agendado';
-    lead.updatedAt = nowTs();
-    data.leads[jid] = lead;
-
-    saveLeads();
-    saveAgendas();
-    ev('agenda_programada', { jid, phoneKey: lead.phoneKey, baseTs });
-    return true;
-  }
-
-  async function sendConfirmNow(phoneKey, tplData = {}) {
-    const jid = phoneKeyToJid(phoneKey);
-    if (!jid) return { ok: false, error: 'bad_phone' };
-
-    const tpl = data.messagesConfig.confirmTemplate || '';
-    const text = applyTemplate(tpl, {
-      DATA: tplData.DATA || '',
-      HORA: tplData.HORA || '',
-      VEICULO: tplData.VEICULO || '',
-      PRODUTO: tplData.PRODUTO || '',
-      VALOR: tplData.VALOR || '',
-      SINAL: tplData.SINAL || '',
-      PAGAMENTO: tplData.PAGAMENTO || '',
-    });
-
-    return sendTextSafe(jid, text, { step: 'confirmTemplate', agenda: true });
-  }
-
-  function cancelAgenda(jid) {
-    if (!jid) return false;
-    delete data.agendas[jid];
-    saveAgendas();
-    ev('agenda_cancelada', { jid });
-    return true;
-  }
-
-  async function sendQuoteNow(phoneKey, payload = {}) {
-    const jid = phoneKeyToJid(phoneKey);
-    if (!jid) return { ok: false, error: 'bad_phone' };
-
-    const lead = getLead(jid);
-    if (payload.vehicle) lead.model = String(payload.vehicle);
-    if (payload.year) lead.year = Number(payload.year);
-    lead.stage = 'cotizado';
-    lead.updatedAt = nowTs();
-    data.leads[jid] = lead;
-    saveLeads();
-
-    const key = payload.productKey || 'ironGlassPlus';
-    const q = data.quotesConfig[key] || data.quotesConfig.ironGlassPlus;
-    const tpl = q.template || '';
-
-    const text = applyTemplate(tpl, {
-      VEICULO: payload.vehicle || lead.model || '',
-      ANO: payload.year || lead.year || '',
-      VALOR: payload.value || '',
-      PAGAMENTO: payload.payment || '',
-    });
-
-    return sendTextSafe(jid, text, { step: `quote_${key}` });
-  }
-
-  function updateQuotes(nextQuotes = {}) {
-    data.quotesConfig = { ...data.quotesConfig, ...(nextQuotes || {}) };
-    saveQuotes();
-    return true;
   }
 
   return {
+    state,
+    data,
     connect,
     disconnect,
-
-    getStatus,
+    sendTextSafe,
     setEnabled,
-    getConfig,
-    getLeads,
-    getDataSnapshot,
-
-    updateMessages,
     updateConfig,
-    setCommands,
-    updateQuotes,
-
-    updateLead,
-    pauseFollowUp,
-    stopFollowUp,
-    setManualOff,
-    blockFollowUp,
-    markAsClient,
-
-    scheduleAgendaFromPanel,
-    sendConfirmNow,
-    cancelAgenda,
-    programStartMessage,
-    sendQuoteNow,
+    updateMessages,
   };
 }
 
