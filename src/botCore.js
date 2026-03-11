@@ -22,6 +22,53 @@ const {
   DisconnectReason,
 } = require('@whiskeysockets/baileys');
 
+
+// ====== Cross-process lock (evita doble envío si Railway levanta 2 instancias) ======
+// Usa un lockfile por botId en DATA_DIR/<botId>/scheduler.lock (en Volume compartido).
+// Si otra instancia ya tiene el lock, esta instancia NO corre scheduler (pero puede servir panel/QR).
+let lockFd = null;
+const LOCK_TTL_MS = Number(process.env.LOCK_TTL_MS || 60000); // 60s
+function lockFilePath(){
+  try{
+    const dataBase = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(baseDir, 'data');
+    return path.join(dataBase, botId, 'scheduler.lock');
+  }catch(_){
+    return path.join(process.cwd(), 'data', botId, 'scheduler.lock');
+  }
+}
+function tryAcquireLock(){
+  const lf = lockFilePath();
+  try { fs.mkdirSync(path.dirname(lf), { recursive:true }); } catch(_){}
+  try{
+    lockFd = fs.openSync(lf, 'wx'); // exclusivo
+    fs.writeFileSync(lockFd, JSON.stringify({ pid: process.pid, ts: Date.now(), botId }), 'utf8');
+    return true;
+  }catch(e){
+    // si existe, verificar staleness
+    try{
+      const st = fs.statSync(lf);
+      if (Date.now() - st.mtimeMs > LOCK_TTL_MS){
+        try { fs.unlinkSync(lf); } catch(_){}
+        lockFd = fs.openSync(lf, 'wx');
+        fs.writeFileSync(lockFd, JSON.stringify({ pid: process.pid, ts: Date.now(), botId, recovered:true }), 'utf8');
+        return true;
+      }
+    }catch(_){}
+    return false;
+  }
+}
+function refreshLock(){
+  if (!lockFd) return;
+  try{
+    fs.futimesSync(lockFd, new Date(), new Date());
+  }catch(_){}
+}
+function releaseLock(){
+  const lf = lockFilePath();
+  try { if (lockFd) fs.closeSync(lockFd); } catch(_){}
+  lockFd = null;
+  try { fs.unlinkSync(lf); } catch(_){}
+}
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 function nowTs(){ return Date.now(); }
 function randomInt(min,max){ return Math.floor(Math.random()*(max-min+1))+min; }
@@ -495,7 +542,24 @@ function createBot({ botId, baseDir, authDir, eventLogger } = {}) {
 
   function startScheduler(){
     if (schedulerHandle) clearInterval(schedulerHandle);
-    schedulerHandle = setInterval(()=>{ schedulerTick().catch(()=>{}); }, SCHEDULER_TICK_MS);
+
+    // Solo una instancia por botId debe correr el scheduler.
+    const hasLock = tryAcquireLock();
+    if (!hasLock){
+      ev('scheduler_lock_skipped', { reason:'lock_taken' });
+      return;
+    }
+    ev('scheduler_lock_acquired', { pid: process.pid });
+
+    schedulerHandle = setInterval(()=>{ 
+      refreshLock();
+      schedulerTick().catch(()=>{}); 
+    }, SCHEDULER_TICK_MS);
+
+    // liberar lock al salir
+    process.on('exit', releaseLock);
+    process.on('SIGTERM', ()=>{ releaseLock(); process.exit(0); });
+    process.on('SIGINT', ()=>{ releaseLock(); process.exit(0); });
   }
 
   // ====== connect/disconnect ======
