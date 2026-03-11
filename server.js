@@ -428,12 +428,7 @@ app.post('/m/toggle-connect', requireAuth, async (req,res)=>{
   if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
   const bot = bots[botId];
   const st = bot.getStatus();
-  if (st.connected) {
-  if (AUTO_NEW_QR_ON_DISCONNECT) await forceNewQr(botId);
-  else await bot.disconnect();
-} else {
-  await bot.connect();
-}
+  if (st.connected) await bot.disconnect(); else await bot.connect();
   res.redirect(`/m${req.user.role==='admin'?`?botId=${botId}`:''}`);
 });
 
@@ -1346,12 +1341,7 @@ app.post('/admin/toggle-connect', requireAuth, async (req,res)=>{
   const botId = req.query.botId;
   if (!BOT_IDS.includes(botId)) return res.redirect('/admin');
   const st = bots[botId].getStatus();
-  if (st.connected) {
-  if (AUTO_NEW_QR_ON_DISCONNECT) await forceNewQr(botId);
-  else await bots[botId].disconnect();
-} else {
-  await bots[botId].connect();
-}
+  if (st.connected) await bots[botId].disconnect(); else await bots[botId].connect();
   res.redirect('/admin');
 });
 
@@ -1775,12 +1765,7 @@ app.post('/m/toggle-connect', requireAuth, async (req,res)=>{
   if (!allowedBotIds(req.user).includes(botId)) return res.status(403).send('forbidden');
   const bot = bots[botId];
   const st = bot.getStatus();
-  if (st.connected) {
-  if (AUTO_NEW_QR_ON_DISCONNECT) await forceNewQr(botId);
-  else await bot.disconnect();
-} else {
-  await bot.connect();
-}
+  if (st.connected) await bot.disconnect(); else await bot.connect();
   res.redirect(`/m${req.user.role==='admin'?`?botId=${botId}`:''}`);
 });
 
@@ -2693,12 +2678,7 @@ app.post('/admin/toggle-connect', requireAuth, async (req,res)=>{
   const botId = req.query.botId;
   if (!BOT_IDS.includes(botId)) return res.redirect('/admin');
   const st = bots[botId].getStatus();
-  if (st.connected) {
-  if (AUTO_NEW_QR_ON_DISCONNECT) await forceNewQr(botId);
-  else await bots[botId].disconnect();
-} else {
-  await bots[botId].connect();
-}
+  if (st.connected) await bots[botId].disconnect(); else await bots[botId].connect();
   res.redirect('/admin');
 });
 
